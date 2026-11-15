@@ -142,6 +142,14 @@ def is_fanfic(work):
     return int(work.get("fanfic") or 0) == 1
 
 
+def web_search_on(work):
+    """全体設定とワークスペース別トグルの両方がONのときだけWeb検索する。"""
+    if db.get_setting("web_search_enabled", "1") == "0":
+        return False
+    v = work.get("web_search")
+    return (1 if v is None else int(v)) == 1
+
+
 def work_mode(work):
     """switch＝モデル切替あり（1次→切替→2次）／ thread＝切替なし・章ごとスレッドで完結。"""
     return work.get("mode") or "switch"
@@ -580,7 +588,7 @@ def checked_terms(work):
 
 def run_term_check(work):
     """モデルに知らない単語を指摘させ、用語DB→Web検索の順で解決する。"""
-    if db.get_setting("web_search_enabled", "1") == "0":
+    if not web_search_on(work):
         return
     texts = [work["settings"] or "", work["request"] or ""]
     for kind in ("source", "analysis"):
@@ -640,8 +648,8 @@ def do_search_term(job, work):
 
     外部へ送るのは検索語（単語・キャラ名）だけ。原稿本文は送らない。
     """
-    if db.get_setting("web_search_enabled", "1") == "0":
-        raise RuntimeError("Web検索が設定で無効になっています。")
+    if not web_search_on(work):
+        raise RuntimeError("Web検索がOFFになっています（全体設定、またはこのワークスペースのトグル）。")
     try:
         payload = json.loads(job.get("payload") or "{}")
     except ValueError:

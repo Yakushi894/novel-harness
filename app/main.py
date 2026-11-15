@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.9"
+APP_VERSION = "1.10"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -407,7 +407,7 @@ def work_detail(work_id: int):
             "<p>ONにすると、AIに二次創作であることが伝わり、キャラクター概要の検索・確認が使えるようになります。</p></div>")
 
     search_html = ""
-    if db.get_setting("web_search_enabled", "1") != "0":
+    if pipeline.web_search_on(w):
         char_form = ""
         if fanfic:
             char_form = (
@@ -431,6 +431,18 @@ def work_detail(work_id: int):
             "<p>素材や本文に出てきた未知の単語をモデルに指摘させ、用語DBにあれば再検索せず、なければ検索して用語DBに追加します。"
             "概要生成と1次出力の前にも自動で実行されます。</p>"
             + char_form + "</div>")
+
+    if db.get_setting("web_search_enabled", "1") == "0":
+        ws_html = ("<p>インターネットから単語の意味を取得：<b>OFF</b>"
+                   "（全体設定でWeb検索が無効になっています）</p>")
+    else:
+        ws_on = pipeline.web_search_on(w)
+        ws_html = (
+            f"<form method='post' action='/works/{w['id']}/websearch'>"
+            f"<input type='hidden' name='web_search' value='{'0' if ws_on else '1'}'>"
+            f"<p>インターネットから単語の意味を取得：<b>{'ON' if ws_on else 'OFF'}</b> "
+            f"<button>{'OFFにする' if ws_on else 'ONにする'}</button> "
+            "<span style='color:#8b93a1'>（OFFの間は、用語の自動チェック・検索をこの作品では行いません）</span></p></form>")
 
     analysis_html = ""
     if analysis:
@@ -526,6 +538,7 @@ def work_detail(work_id: int):
     {notice_html}
     <div class='card'><h2>工程の実行</h2>
     <p>モード：<b>{'スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）'}</b>（作品情報で変更できます）</p>
+    {ws_html}
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='outline'><button>2. 次章の内容（各章概要）を生成</button></form>
     {thread_buttons if (w.get('mode') or 'switch') == 'thread' else switch_buttons}
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p></div>
@@ -568,12 +581,24 @@ def work_delete(work_id: int):
 def glossary_index():
     rows = db.q("SELECT * FROM glossary ORDER BY term")
     items = "".join(
-        f"<div class='card'><a href='/glossary/view?term={esc(r['term'])}'><b>{esc(r['term'])}</b></a>"
-        f" <form method='post' action='/glossary/delete' style='display:inline'>"
-        f"<input type='hidden' name='term' value=\"{esc(r['term'])}\"><button>削除</button></form></div>"
-        for r in rows) or "<p>まだ用語が登録されていません。</p>"
+        f"<div class='card'><label><input type='checkbox' name='terms' value=\"{esc(r['term'])}\"> "
+        f"<a href='/glossary/view?term={esc(r['term'])}'><b>{esc(r['term'])}</b></a></label></div>"
+        for r in rows)
+    if rows:
+        items = (
+            "<form method='post' action='/glossary/delete_selected' "
+            "onsubmit=\"return confirm('選択した用語を削除しますか？（各作品の用語メモも一緒に消えます）')\">"
+            + items
+            + "<p><button style='background:#b03a3a;border-color:#b03a3a'>選択した用語を削除</button></p></form>"
+            "<form method='post' action='/glossary/delete_all' "
+            "onsubmit=\"return confirm('用語DBの全ての用語を削除しますか？（各作品の用語メモも一緒に消えます）')\">"
+            "<p><button style='background:#b03a3a;border-color:#b03a3a'>全て削除</button></p></form>")
+    else:
+        items = "<p>まだ用語が登録されていません。</p>"
     return page("用語DB", "<p>検索して覚えた単語の意味はここに残ります。"
-                "ワークスペースを削除しても消えません。同じ単語は2回目から検索に行かず、このメモを使います。</p>" + items)
+                "ワークスペースを削除しても消えません。同じ単語は2回目から検索に行かず、このメモを使います。</p>"
+                "<p>作品で使われた用語メモは、その作品の生成コンテキストに毎回入ります。"
+                "関係ない用語が増えたら、ここで削除してください（作品側の用語メモも一緒に消えます。再取得防止の記録は残るため、削除した用語がすぐ検索し直されることはありません）。</p>" + items)
 
 
 @app.get("/glossary/view")
@@ -584,9 +609,35 @@ def glossary_view(term: str):
     return page(f"用語：{term}", f"<pre>{esc(row['memo'])}</pre>")
 
 
+def _delete_glossary_terms(terms):
+    """用語DBから消し、各作品の生成コンテキストに入っている用語メモ（成果物）も一緒に消す。"""
+    for term in terms:
+        db.run("DELETE FROM glossary WHERE term=?", (term,))
+        fname = "glossary_" + re.sub(r"[^\w]+", "_", term)[:40] + ".txt"
+        for a in db.q("SELECT * FROM artifacts WHERE kind='glossary'"):
+            if a["path"].endswith(fname):
+                try:
+                    os.remove(a["path"])
+                except OSError:
+                    pass
+                db.run("DELETE FROM artifacts WHERE id=?", (a["id"],))
+
+
 @app.post("/glossary/delete")
 def glossary_delete(term: str = Form(...)):
-    db.run("DELETE FROM glossary WHERE term=?", (term,))
+    _delete_glossary_terms([term])
+    return RedirectResponse("/glossary", status_code=303)
+
+
+@app.post("/glossary/delete_selected")
+def glossary_delete_selected(terms: list[str] = Form([])):
+    _delete_glossary_terms([t for t in terms if t])
+    return RedirectResponse("/glossary", status_code=303)
+
+
+@app.post("/glossary/delete_all")
+def glossary_delete_all():
+    _delete_glossary_terms([r["term"] for r in db.q("SELECT term FROM glossary")])
     return RedirectResponse("/glossary", status_code=303)
 
 
@@ -594,6 +645,13 @@ def glossary_delete(term: str = Form(...)):
 def work_fanfic(work_id: int, fanfic: int = Form(0)):
     db.run("UPDATE works SET fanfic=?, updated_at=? WHERE id=?",
            (1 if fanfic else 0, db.now(), work_id))
+    return RedirectResponse(f"/works/{work_id}", status_code=303)
+
+
+@app.post("/works/{work_id}/websearch")
+def work_websearch(work_id: int, web_search: int = Form(0)):
+    db.run("UPDATE works SET web_search=?, updated_at=? WHERE id=?",
+           (1 if web_search else 0, db.now(), work_id))
     return RedirectResponse(f"/works/{work_id}", status_code=303)
 
 

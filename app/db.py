@@ -97,6 +97,9 @@ def init_db():
         if "min_chars" not in cols:
             c.execute("ALTER TABLE works ADD COLUMN min_chars INTEGER DEFAULT 0")
             c.commit()
+        if "web_search" not in cols:
+            c.execute("ALTER TABLE works ADD COLUMN web_search INTEGER DEFAULT 1")
+            c.commit()
         jcols = [r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
         if "usage" not in jcols:
             c.execute("ALTER TABLE jobs ADD COLUMN usage TEXT DEFAULT ''")
