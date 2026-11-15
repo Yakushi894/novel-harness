@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -330,6 +330,22 @@ def fmt_dur(sec) -> str:
     return f"{sec // 3600}時間{sec % 3600 // 60}分"
 
 
+JOB_STATUS_STYLE = {
+    "done": "color:#1a9e4b",       # 完了：緑
+    "failed": "color:#e5484d",     # イレギュラーな停止：赤
+    "cancelled": "color:#e8862e",  # 取消・異常終了：オレンジ
+    "running": "color:#2e6fdb",    # 実行中：青
+    "queued": "color:#8b93a1",     # 待機中：グレー
+}
+
+
+def status_html(status) -> str:
+    style = JOB_STATUS_STYLE.get(status or "")
+    if style:
+        return f"<span style='{style};font-weight:bold'>{esc(status)}</span>"
+    return esc(status)
+
+
 def usage_html(job) -> str:
     """ジョブの usage を「thinking: X of budget B (max M) tokens」形式のメーターで出す。
 
@@ -473,7 +489,7 @@ def work_detail(work_id: int):
         else:
             dur = ""
         job_rows += (
-            f"<div>#{j['id']} {esc(j['kind'])} ― {esc(j['status'])} {dur} {esc(j['error'])}"
+            f"<div>#{j['id']} {esc(j['kind'])} ― {status_html(j['status'])} {dur} {esc(j['error'])}"
             + (f" <form method='post' action='/jobs/{j['id']}/cancel' style='display:inline'><button>取消</button></form>"
                if j["status"] in ("queued", "running") else "") + "</div>"
             + usage_html(j))
@@ -677,7 +693,7 @@ def chapter_page(chapter_id: int):
                 (w["id"],))
     active = any(j["status"] in ("queued", "running") for j in jobs)
     job_html = "".join(
-        f"<div>#{j['id']} 再生成 ― {esc(j['status'])} {esc(j['error'])}</div>" + usage_html(j)
+        f"<div>#{j['id']} 再生成 ― {status_html(j['status'])} {esc(j['error'])}</div>" + usage_html(j)
         for j in jobs)
 
     body_html = (f"<pre>{esc(pipeline.read_text(body_art['path']))}</pre>"
