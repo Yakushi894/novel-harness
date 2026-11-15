@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.10"
+APP_VERSION = "1.11"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -347,10 +347,11 @@ def status_html(status) -> str:
 
 
 def usage_html(job) -> str:
-    """ジョブの usage を「thinking: X of budget B (max M) tokens」形式のメーターで出す。
+    """ジョブの usage をメーターで出す。メーターは「直近の呼び出し」基準で、
 
+    上限（max／budget）は1回ごとの値。ジョブ合計は別行に参考表示する。
     thinking の内訳はサーバーが usage に含めて返す場合だけ分かる。返らない場合は
-    出力トークン総数で代替表示する（内訳は捏造しない）。
+    出力トークンで代替表示する（内訳は捏造しない）。
     """
     raw = job.get("usage") or ""
     if not raw:
@@ -362,19 +363,34 @@ def usage_html(job) -> str:
     if not u.get("calls"):
         return ""
     budget = llm.reasoning_budget()
-    rt, comp, mx = u.get("reasoning_tokens"), u.get("completion_tokens"), u.get("last_max_tokens")
-    if isinstance(rt, int):
-        main = f"thinking: {rt} of budget {budget if budget > 0 else '―'} (max {mx if mx else '―'}) tokens"
-        pct = (rt / budget * 100) if budget > 0 else ((rt / mx * 100) if mx else 0)
-    elif isinstance(comp, int):
-        main = f"output: {comp} (max {mx if mx else '―'}) tokens（thinking 内訳はサーバー未提供）"
-        pct = (comp / mx * 100) if mx else 0
+    mx = u.get("last_max_tokens")
+    calls = u["calls"]
+    # メーターは「直近の呼び出し」基準：上限（max／budget）は1回ごとの値なので、
+    # ジョブ合計と並べると上限超過に見えてしまう。合計は別記する。
+    last_rt = u.get("last_reasoning_tokens")
+    last_comp = u.get("last_completion_tokens")
+    if not isinstance(last_rt, int) and not isinstance(last_comp, int):
+        # 旧形式（last_* なし）：合計しか分からないので上限とは並べない
+        comp = u.get("completion_tokens")
+        if not isinstance(comp, int):
+            return ""
+        return (f"<div class='usage'>output: 合計 {comp} tokens"
+                f" ／ 入力 合計 {u.get('prompt_tokens', '―')} tokens"
+                f"・API呼び出し {calls}回</div>")
+    if isinstance(last_rt, int):
+        main = f"thinking: 直近 {last_rt} of budget {budget if budget > 0 else '―'} (max {mx if mx else '―'}) tokens"
+        pct = (last_rt / budget * 100) if budget > 0 else ((last_rt / mx * 100) if mx else 0)
     else:
-        return ""
+        main = f"output: 直近 {last_comp} (max {mx if mx else '―'}) tokens（thinking 内訳はサーバー未提供）"
+        pct = (last_comp / mx * 100) if mx else 0
     pct = max(0.0, min(100.0, pct))
-    return (f"<div class='usage'>{esc(main)} ／ 入力 {u.get('prompt_tokens', '―')} tokens"
-            f"・API呼び出し {u['calls']}回</div>"
-            f"<div class='meter'><div style='width:{pct:.0f}%'></div></div>")
+    html_out = (f"<div class='usage'>{esc(main)} ／ 入力： 直近 {u.get('last_prompt_tokens', '―')} tokens</div>"
+                f"<div class='meter'><div style='width:{pct:.0f}%'></div></div>")
+    if calls > 1:
+        html_out += (f"<div class='usage'>ジョブ合計： output {u.get('completion_tokens', '―')}"
+                     f" ／ 入力 {u.get('prompt_tokens', '―')} tokens"
+                     f"・API呼び出し {calls}回（1回最大 output {u.get('peak_completion_tokens', '―')}）</div>")
+    return html_out
 
 
 def enqueue(work_id: int, kind: str, payload: dict | None = None):

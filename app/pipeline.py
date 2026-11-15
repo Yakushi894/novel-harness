@@ -761,6 +761,10 @@ def _usage_sink_for(job_id):
             v = rec.get(k)
             if isinstance(v, int):
                 acc[k] = acc.get(k, 0) + v if isinstance(acc.get(k), int) else v
+                acc["last_" + k] = v
+        v = rec.get("completion_tokens")
+        if isinstance(v, int):
+            acc["peak_completion_tokens"] = max(acc.get("peak_completion_tokens", 0), v)
         acc["last_max_tokens"] = rec.get("max_tokens")
         if rec.get("model"):
             acc["model"] = rec["model"]
