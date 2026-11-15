@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -466,6 +466,13 @@ def work_detail(work_id: int):
         + (f" <form method='post' action='/artifacts/{a['id']}/delete' style='display:inline'><button>削除</button></form>"
            if a["kind"] in ("glossary", "character", "analysis", "source") else "") + "</div>"
         for a in arts)
+    source_html = "".join(
+        f"<div>📄 <a href='/artifacts/{a['id']}'>{esc(os.path.basename(a['path']))}</a>"
+        f" <form method='post' action='/artifacts/{a['id']}/delete' style='display:inline' "
+        f"onsubmit=\"return confirm('このファイルを削除しますか？')\"><button>削除</button></form></div>"
+        for a in arts if a["kind"] == "source")
+    if source_html:
+        source_html = "<p>アップロード済みファイル：</p>" + source_html
 
     body = f"""
     <p>状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}</p>
@@ -476,6 +483,7 @@ def work_detail(work_id: int):
     <div class='card'><h2>1. 続き読み込み（素材ファイル：Txt等）</h2>
     <form method='post' action='/works/{w['id']}/upload' enctype='multipart/form-data'>
     <input type='file' name='file'> <button>アップロード</button></form>
+    {source_html}
     <p>既存本文や設定資料を取り込むと、続き生成の起点になります。</p>
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='analyze'><button>初期文書解析を実行（アップロード済み文書から基礎資料を作成）</button></form>
     </div>
