@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -249,7 +249,10 @@ def index():
     works = db.q("SELECT * FROM works ORDER BY id DESC")
     items = "".join(
         f"<div class='card'><a href='/works/{w['id']}'><b>{esc(w['title'])}</b></a>"
-        f" ― 状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}</div>"
+        f" ― 状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}"
+        f" <form method='post' action='/works/{w['id']}/delete' style='display:inline' "
+        f"onsubmit=\"return confirm('このワークスペースを削除しますか？（作品データが消えます。用語DBは残ります）')\">"
+        f"<button style='background:#b03a3a;border-color:#b03a3a'>削除</button></form></div>"
         for w in works) or "<p>まだワークスペースがありません。左のサイドバーか下のフォームから作成してください。</p>"
     form = """<div class='card'><h2>新規ワークスペース（物語ごとに作成）</h2>
     <form method='post' action='/works' enctype='multipart/form-data'>
@@ -510,7 +513,7 @@ def work_detail(work_id: int):
     <label><input type='radio' name='mode' value='thread' {'checked' if (w.get('mode') or 'switch') == 'thread' else ''}> スレッドモード（切替なし）</label></div>
     <button>保存</button></form></div>
     <div class='card'><h2>ワークスペースの削除</h2>
-    <form method='post' action='/works/{w['id']}/delete'>
+    <form method='post' action='/works/{w['id']}/delete' onsubmit="return confirm('このワークスペースを削除しますか？（作品データが消えます。用語DBは残ります）')">
     <button style='background:#b03a3a;border-color:#b03a3a'>このワークスペースを削除</button></form>
     <p>作品データは消えますが、<b>用語DBに覚えた単語の意味は残ります</b>（次回から再検索せず使えます）。</p></div>"""
     active = any(j["status"] in ("queued", "running") for j in jobs)
