@@ -232,3 +232,12 @@ Synology Container Manager 上の docker-compose で単一コンテナとして�
 - **オーバー警告をセクション上部にも複製表示**（tokenOverTop）。保存ボタン下の従来表示と連動し、入力しているその場で見える。
 - **インラインイベント属性に二重化**：Context Window の select に onchange/oninput='HAlloc()'、2次用 select に 'HRev()'、数値入力欄（_num_row）に oninput='HCheck()' を付与し、末尾スクリプトの addEventListener と併用。関数は window.HAlloc/HCheck/HRev として公開し、フォーム前に no-op スタブを置いて未定義エラーを防止。
 - 検証は配信ページ実物に対する Node DOM シミュレーションで実施（インラインハンドラ経路で再配置・両警告・警告クリアまで確認）。
+
+
+## 23. v1.5 更新（2026-11-15）― 設定JSが動かなかった真因と修正
+
+ユーザー再報告「再配置されません」を受け、実DOM（jsdom）で配信ページ実物を再現し、真因を特定した。
+
+- **真因**：設定フォームの HTML 構造。`<form>` を「接続先」カードの途中で開き、カードの `</div>` を跨いで「モデル / 生成パラメータ」カード内の保存ボタン直前で閉じていた。HTML パーサはカードの `</div>` で form をオープン要素スタックから取り除くため、パース後の DOM ツリーでは select や Max Tokens 入力欄が form の子孫にならない（送信時の form owner 関連付けは form element pointer で別途効くため、保存自体は正常に動いていた）。そのため `form.querySelector('select[name="ctx_window"]')` が null を返し、`ctxSel.addEventListener` で TypeError が発生してスクリプト全体（再配置・警告・HAlloc 本体代入）が初期化途中で死んでいた。v1.2〜v1.4 の全バージョンで再現する不具合。自作の簡易 DOM シムでは form.querySelector を全要素検索で代用していたため検出できなかった（反省点：検証は実DOMで行う）。
+- **修正**：①`<form>` を「接続先」カードの外側（手前）で開き、`</form>` を「モデル / 生成パラメータ」カードの `</div>` の後ろへ移動。全コントロールが form の正規の子孫になった。②JS 側も多重防御として、要素探索を document スコープに変更し、ctxSel/revSel の null ガードを追加。
+- **検証**：jsdom で修正前ページでは TypeError＋無反応を再現、修正後ページでは change/input 両イベントで再配置（256k→128k で本文 117760→58880）、無茶な値 11,776,000 で上部・下部両方の警告表示、JS エラーなし、を確認。保存（POST）のサーバー側再配置も従来どおり動作。

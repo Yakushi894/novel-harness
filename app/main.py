@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -762,9 +762,9 @@ def settings_form():
     ctx_rev_opts = _ctx_opts(pipeline.ctx_window_revise())
     body = f"""
     <script>window.HAlloc=window.HAlloc||function(){{}};window.HCheck=window.HCheck||function(){{}};window.HRev=window.HRev||function(){{}};</script>
+    <form method='post' action='/settings'>
     <div class='card'><h2>接続先（推論サーバー）</h2>
     <p>状態：{conn}</p>
-    <form method='post' action='/settings'>
     <div class='row'>接続先URL（XeStrata の OpenAI 互換API）<input type='text' name='strata_base_url' value="{esc(cur_url)}" placeholder='http://192.168.1.10:8080'></div>
     <div class='row'>APIキー（{'設定済み' if has_key else '未設定'}／空欄なら変更しません。LAN 内でキー不要な場合は空のままでOK）<input type='password' name='strata_api_key' value=''></div>
     <div class='row'>2次修正モデルの目印（ロード中モデルIDに含まれる文字列。空欄なら「1次出力と違うモデルへの変更」で判定）<input type='text' name='revise_model_hint' value="{esc(db.get_setting('revise_model_hint', ''))}" placeholder='例：q4'></div>
@@ -785,14 +785,13 @@ def settings_form():
     <div class='row'><label><input type='checkbox' name='web_search_enabled' value='1' {'checked' if db.get_setting('web_search_enabled', '1') != '0' else ''}> Web検索を有効にする（用語・キャラクター検索。外部へ送るのは検索語のみ）</label></div>
     <div class='row'><label><input type='checkbox' name='show_fanfic_button' value='1' {'checked' if db.get_setting('show_fanfic_button', '1') != '0' else ''}> 二次創作ボタンを表示する</label></div>
     <button>保存</button>
-    <div id='tokenOver' style='color:#e5484d;font-weight:bold;margin-top:.5em'></div></form>
+    <div id='tokenOver' style='color:#e5484d;font-weight:bold;margin-top:.5em'></div>
     <p>保存すると即時反映されます（コンテナ再起動は不要）。モデル自体は相手先API準拠で、
-    各リクエスト時点でサーバーがサーブ中のモデルが使われます。</p></div>
+    各リクエスト時点でサーバーがサーブ中のモデルが使われます。</p></div></form>
     <script>
     (function () {{
-      var form = document.querySelector('form[action="/settings"]');
-      if (!form) return;
-      var ctxSel = form.querySelector('select[name="ctx_window"]');
+      var ctxSel = document.querySelector('select[name="ctx_window"]');
+      var revSel = document.querySelector('select[name="ctx_window_revise"]');
       var names = ['max_tokens_outline', 'max_tokens_design', 'max_tokens_chapter',
                    'max_tokens_summary', 'max_tokens_revise'];
       function alloc(ctx) {{
@@ -803,9 +802,9 @@ def settings_form():
           max_tokens_revise: v(0.25, 4096)
         }};
       }}
-      function field(n) {{ return form.querySelector('input[name="' + n + '"]'); }}
+      function field(n) {{ return document.querySelector('input[name="' + n + '"]'); }}
       function check() {{
-        var ctx = parseInt(ctxSel.value || '0', 10) || 0;
+        var ctx = ctxSel ? (parseInt(ctxSel.value || '0', 10) || 0) : 0;
         var sum = 0;
         names.forEach(function (n) {{
           var el = field(n);
@@ -822,19 +821,21 @@ def settings_form():
         }});
       }}
       function applyCtx() {{
+        if (!ctxSel) return;
         var a = alloc(parseInt(ctxSel.value || '0', 10) || 0);
         names.forEach(function (n) {{ var el = field(n); if (el) el.value = a[n]; }});
         check();
       }}
-      ctxSel.addEventListener('change', applyCtx);
-      ctxSel.addEventListener('input', applyCtx);
-      var revSel = form.querySelector('select[name="ctx_window_revise"]');
       function revNote() {{
         var el = document.getElementById('reviseAlloc');
         if (!el || !revSel) return;
         var rc = parseInt(revSel.value || '0', 10) || 0;
         var v = Math.max(4096, Math.floor(rc * 0.8 / 256) * 256);
         el.textContent = rc ? ' → モデル変更時の2次修正 Max Tokens: ' + v.toLocaleString() + '（この値の80%）' : '';
+      }}
+      if (ctxSel) {{
+        ctxSel.addEventListener('change', applyCtx);
+        ctxSel.addEventListener('input', applyCtx);
       }}
       if (revSel) {{
         revSel.addEventListener('change', revNote);
