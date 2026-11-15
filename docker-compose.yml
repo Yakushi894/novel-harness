@@ -1,0 +1,12 @@
+# 本番用（DS1621 / Container Manager の「プロジェクト」にそのまま取り込み可能）
+# 環境変数は不要：接続先や生成パラメータは Web UI の「設定」画面で変更する。
+services:
+  harness:
+    image: yuichi894/novel-harness:latest
+    container_name: novel-harness
+    restart: unless-stopped
+    ports:
+      - "18080:8080"
+    volumes:
+      - /volume1/docker/novel-harness/data:/data
+      - /volume1/docker/novel-harness/works:/works

@@ -1,0 +1,19 @@
+# 開発・検証用（vDSM 等でソースからビルドする）
+services:
+  harness:
+    build: .
+    image: novel-harness:latest
+    container_name: novel-harness
+    restart: unless-stopped
+    ports:
+      - "18080:8080"
+    environment:
+      STRATA_BASE_URL: "${STRATA_BASE_URL:-}"
+      STRATA_API_KEY: "${STRATA_API_KEY:-}"
+      CHAT_WEBHOOK_URL: "${CHAT_WEBHOOK_URL:-}"
+      UI_TOKEN: "${UI_TOKEN:-}"
+      MOCK_LLM: "${MOCK_LLM:-0}"
+      MOCK_LOADED_MODEL: "${MOCK_LOADED_MODEL:-mock-q3}"
+    volumes:
+      - ./data:/data
+      - /volume1/docker/novel-harness/works:/works
