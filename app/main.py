@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -740,7 +740,7 @@ def work_download(work_id: int):
 
 def _num_row(label, name, value, note=""):
     return (f"<div class='row'>{label}<input type='text' name='{name}' value='{esc(value)}' "
-            f"style='width:10em'> {esc(note)}</div>")
+            f"style='width:10em' oninput='HCheck()'> {esc(note)}</div>")
 
 
 @app.get("/settings")
@@ -761,6 +761,7 @@ def settings_form():
     ctx_opts = _ctx_opts(pipeline.ctx_window())
     ctx_rev_opts = _ctx_opts(pipeline.ctx_window_revise())
     body = f"""
+    <script>window.HAlloc=window.HAlloc||function(){{}};window.HCheck=window.HCheck||function(){{}};window.HRev=window.HRev||function(){{}};</script>
     <div class='card'><h2>接続先（推論サーバー）</h2>
     <p>状態：{conn}</p>
     <form method='post' action='/settings'>
@@ -770,8 +771,10 @@ def settings_form():
     <div class='row'>Synology Chat Webhook URL（空欄なら通知はコンテナのログのみ）<input type='text' name='chat_webhook_url' value="{esc(db.get_setting('chat_webhook_url', ''))}"></div>
     </div>
     <div class='card'><h2>モデル / 生成パラメータ</h2>
-    <div class='row'>Context Window（トークン）<select name='ctx_window'>{ctx_opts}</select> プロンプトに載せる文脈量の目安に使います（実際の上限はサーバー側の最大コンテキストです）。<b>変更すると、その場で下の各 Max Tokens が比率に応じて再配置されます</b>（初期値は合計で約90%を使う配分です。手動調整した値も再配置で上書きされます）</div>
-    <div class='row'>Context Window（2次修正用）<select name='ctx_window_revise'>{ctx_rev_opts}</select><span id='reviseAlloc' style='font-weight:bold'></span> 2次修正はモデルが変わる前提なので、大きめのモデルに合わせて最大にしておくのが既定です。モデル変更時の2次修正では、この値の<b>80%</b>を Max Tokens に自動設定します。モデルが変わらない場合（スレッドモード等）は、通常の Context Window の配分を流用します</div>
+    <p style='color:#e5484d;font-weight:bold;margin:.3em 0'>※ 値を変更しても、保存を押すまで変更されません（画面の数値はプレビューです）。</p>
+    <div id='tokenOverTop' style='color:#e5484d;font-weight:bold'></div>
+    <div class='row'>Context Window（トークン）<select name='ctx_window' onchange='HAlloc()' oninput='HAlloc()'>{ctx_opts}</select> プロンプトに載せる文脈量の目安に使います（実際の上限はサーバー側の最大コンテキストです）。<b>変更すると、その場で下の各 Max Tokens が比率に応じて再配置されます</b>（初期値は合計で約90%を使う配分です。手動調整した値も再配置で上書きされます）</div>
+    <div class='row'>Context Window（2次修正用）<select name='ctx_window_revise' onchange='HRev()' oninput='HRev()'>{ctx_rev_opts}</select><span id='reviseAlloc' style='font-weight:bold'></span> 2次修正はモデルが変わる前提なので、大きめのモデルに合わせて最大にしておくのが既定です。モデル変更時の2次修正では、この値の<b>80%</b>を Max Tokens に自動設定します。モデルが変わらない場合（スレッドモード等）は、通常の Context Window の配分を流用します</div>
     {_num_row('Max Tokens：概要生成', 'max_tokens_outline', pipeline.max_tokens('max_tokens_outline', 'MAX_TOKENS_OUTLINE', 16384))}
     {_num_row('Max Tokens：生成指示書・文書解析', 'max_tokens_design', pipeline.max_tokens('max_tokens_design', 'MAX_TOKENS_DESIGN', 8192))}
     {_num_row('Max Tokens：本文生成（1次出力）', 'max_tokens_chapter', pipeline.max_tokens('max_tokens_chapter', 'MAX_TOKENS_CHAPTER', 32768), '思考トークンも内数です')}
@@ -808,13 +811,15 @@ def settings_form():
           var el = field(n);
           sum += parseInt((el && el.value) || '0', 10) || 0;
         }});
-        var w = document.getElementById('tokenOver');
+        var msg = '';
         if (ctx && sum > ctx) {{
-          w.textContent = (sum - ctx).toLocaleString() + 'トークンオーバーです（合計 '
+          msg = (sum - ctx).toLocaleString() + 'トークンオーバーです（合計 '
             + sum.toLocaleString() + ' / Context Window ' + ctx.toLocaleString() + '）';
-        }} else {{
-          w.textContent = '';
         }}
+        ['tokenOver', 'tokenOverTop'].forEach(function (id) {{
+          var w = document.getElementById(id);
+          if (w) w.textContent = msg;
+        }});
       }}
       function applyCtx() {{
         var a = alloc(parseInt(ctxSel.value || '0', 10) || 0);
@@ -835,6 +840,9 @@ def settings_form():
         revSel.addEventListener('change', revNote);
         revSel.addEventListener('input', revNote);
       }}
+      window.HAlloc = applyCtx;
+      window.HCheck = check;
+      window.HRev = revNote;
       revNote();
       names.forEach(function (n) {{
         var el = field(n);
