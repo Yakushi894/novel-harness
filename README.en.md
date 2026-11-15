@@ -103,7 +103,7 @@ You can also **download / restore a full backup (zip of the DB + generated files
 
 ### 2. Create a work and generate
 
-1. Create a workspace on the top page (title, concept, settings, chapter count; a source TXT can be uploaded directly at creation).
+1. Create a workspace on the top page (title, concept, settings, chapter count; a source TXT can be attached at creation or dragged & dropped onto the page).
 2. Optionally upload a source text file (step 1: load source).
 3. Click "2. Next-chapter content (chapter outlines)", then edit and save (approve) each outline.
 4. Click "3. First pass" — instruction sheet, body, and summary are produced per chapter automatically.

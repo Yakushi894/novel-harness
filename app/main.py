@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -170,6 +170,71 @@ def login(token: str = Form("")):
     return resp
 
 
+_DROP_OVERLAY = ("<div id='dropOverlay' style='display:none;position:fixed;inset:0;"
+                 "background:rgba(36,150,237,.13);border:3px dashed #2496ed;z-index:9999;"
+                 "pointer-events:none;text-align:center;padding-top:42vh;font-size:1.25em;"
+                 "font-weight:bold;color:#1b6ac9'>__MSG__</div>")
+
+_DROP_JS_COMMON = """
+  var overlay = document.getElementById('dropOverlay');
+  function hasFiles(e) {
+    return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0;
+  }
+  window.addEventListener('dragover', function (e) {
+    if (hasFiles(e)) { e.preventDefault(); overlay.style.display = 'block'; }
+  });
+  window.addEventListener('dragleave', function (e) {
+    if (!e.relatedTarget) overlay.style.display = 'none';
+  });
+"""
+
+# 作品ページ：ドロップしたファイルをその作品の素材として即アップロードする。
+DROP_SCRIPT_WORK = (
+    _DROP_OVERLAY.replace("__MSG__", "TXTファイルをドロップすると素材に追加します")
+    + "<script>(function () {" + _DROP_JS_COMMON + """
+  window.addEventListener('drop', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    overlay.style.display = 'none';
+    var f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f) return;
+    var fd = new FormData();
+    fd.append('file', f);
+    fetch('/works/__WID__/upload', { method: 'POST', body: fd })
+      .then(function () { location.reload(); });
+  });
+})();</script>""")
+
+# トップページ：ドロップしたファイルをワークスペース作成フォームにセットする。
+DROP_SCRIPT_INDEX = (
+    _DROP_OVERLAY.replace("__MSG__", "TXTファイルをドロップすると作成フォームにセットします")
+    + "<script>(function () {" + _DROP_JS_COMMON + """
+  var form = document.querySelector('form[action="/works"]');
+  var input = form ? form.querySelector('input[name="source_file"]') : null;
+  var dropped = null;
+  window.addEventListener('drop', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    overlay.style.display = 'none';
+    var f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f || !input) return;
+    dropped = f;
+    try { input.files = e.dataTransfer.files; } catch (err) {}
+    var s = document.getElementById('srcName');
+    if (s) s.textContent = '選択中: ' + f.name;
+  });
+  if (form) form.addEventListener('submit', function (e) {
+    if (dropped && input && (!input.files || !input.files.length)) {
+      e.preventDefault();
+      var fd = new FormData(form);
+      fd.set('source_file', dropped);
+      fetch('/works', { method: 'POST', body: fd })
+        .then(function (r) { location.href = r.url; });
+    }
+  });
+})();</script>""")
+
+
 def setup_banner() -> str:
     if llm.MOCK or llm.base_url():
         return ""
@@ -191,7 +256,7 @@ def index():
     <div class='row'>タイトル<input type='text' name='title' required></div>
     <div class='row'>欲しい内容<textarea name='request' rows='5'></textarea></div>
     <div class='row'>設定資料<textarea name='settings' rows='5'></textarea></div>
-    <div class='row'>素材テキスト（任意・作成と同時にアップロード）<input type='file' name='source_file' accept='.txt,.md,.text,text/plain'></div>
+    <div class='row'>素材テキスト（任意・作成と同時にアップロード）<input type='file' name='source_file' accept='.txt,.md,.text,text/plain'> <span id='srcName'></span>（画面へドラッグ＆ドロップでもセットできます）</div>
     <div class='row'>章数<input type='text' name='num_chapters' value='3' style='width:4em'></div>
     <div class='row'>章の最低文字数<select name='min_chars'>""" + min_chars_options(0) + """</select>
     （届かない場合は自動で続きを書き足します）</div>
@@ -201,7 +266,7 @@ def index():
     <div class='row'><label><input type='checkbox' name='claude_ok' value='1'> Muse監修レーン可</label></div>
     <button>作成</button></form></div>"""
     steps = "<p class='steps'>工程：" + " ⇒ ".join(FLOW_STEPS) + "</p>"
-    return page("小説ハーネス", setup_banner() + steps + items + form)
+    return page("小説ハーネス", setup_banner() + steps + items + form + DROP_SCRIPT_INDEX)
 
 
 @app.post("/works")
@@ -441,7 +506,8 @@ def work_detail(work_id: int):
     <button style='background:#b03a3a;border-color:#b03a3a'>このワークスペースを削除</button></form>
     <p>作品データは消えますが、<b>用語DBに覚えた単語の意味は残ります</b>（次回から再検索せず使えます）。</p></div>"""
     active = any(j["status"] in ("queued", "running") for j in jobs)
-    return page(w["title"], body, current_id=work_id, chapters=chapters, refresh=active)
+    return page(w["title"], body + DROP_SCRIPT_WORK.replace("__WID__", str(work_id)),
+                current_id=work_id, chapters=chapters, refresh=active)
 
 
 @app.post("/works/{work_id}/delete")
@@ -705,7 +771,7 @@ def settings_form():
     </div>
     <div class='card'><h2>モデル / 生成パラメータ</h2>
     <div class='row'>Context Window（トークン）<select name='ctx_window'>{ctx_opts}</select> プロンプトに載せる文脈量の目安に使います（実際の上限はサーバー側の最大コンテキストです）。<b>変更すると、その場で下の各 Max Tokens が比率に応じて再配置されます</b>（初期値は合計で約90%を使う配分です。手動調整した値も再配置で上書きされます）</div>
-    <div class='row'>Context Window（2次修正用）<select name='ctx_window_revise'>{ctx_rev_opts}</select> 2次修正はモデルが変わる前提なので、大きめのモデルに合わせて最大にしておくのが既定です。モデル変更時の2次修正では、この値の<b>80%</b>を Max Tokens に自動設定します。モデルが変わらない場合（スレッドモード等）は、通常の Context Window の配分を流用します</div>
+    <div class='row'>Context Window（2次修正用）<select name='ctx_window_revise'>{ctx_rev_opts}</select><span id='reviseAlloc' style='font-weight:bold'></span> 2次修正はモデルが変わる前提なので、大きめのモデルに合わせて最大にしておくのが既定です。モデル変更時の2次修正では、この値の<b>80%</b>を Max Tokens に自動設定します。モデルが変わらない場合（スレッドモード等）は、通常の Context Window の配分を流用します</div>
     {_num_row('Max Tokens：概要生成', 'max_tokens_outline', pipeline.max_tokens('max_tokens_outline', 'MAX_TOKENS_OUTLINE', 16384))}
     {_num_row('Max Tokens：生成指示書・文書解析', 'max_tokens_design', pipeline.max_tokens('max_tokens_design', 'MAX_TOKENS_DESIGN', 8192))}
     {_num_row('Max Tokens：本文生成（1次出力）', 'max_tokens_chapter', pipeline.max_tokens('max_tokens_chapter', 'MAX_TOKENS_CHAPTER', 32768), '思考トークンも内数です')}
@@ -750,11 +816,26 @@ def settings_form():
           w.textContent = '';
         }}
       }}
-      ctxSel.addEventListener('change', function () {{
+      function applyCtx() {{
         var a = alloc(parseInt(ctxSel.value || '0', 10) || 0);
         names.forEach(function (n) {{ var el = field(n); if (el) el.value = a[n]; }});
         check();
-      }});
+      }}
+      ctxSel.addEventListener('change', applyCtx);
+      ctxSel.addEventListener('input', applyCtx);
+      var revSel = form.querySelector('select[name="ctx_window_revise"]');
+      function revNote() {{
+        var el = document.getElementById('reviseAlloc');
+        if (!el || !revSel) return;
+        var rc = parseInt(revSel.value || '0', 10) || 0;
+        var v = Math.max(4096, Math.floor(rc * 0.8 / 256) * 256);
+        el.textContent = rc ? ' → モデル変更時の2次修正 Max Tokens: ' + v.toLocaleString() + '（この値の80%）' : '';
+      }}
+      if (revSel) {{
+        revSel.addEventListener('change', revNote);
+        revSel.addEventListener('input', revNote);
+      }}
+      revNote();
       names.forEach(function (n) {{
         var el = field(n);
         if (el) el.addEventListener('input', check);
