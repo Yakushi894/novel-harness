@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -212,6 +212,21 @@ DROP_SCRIPT_INDEX = (
   var form = document.querySelector('form[action="/works"]');
   var input = form ? form.querySelector('input[name="source_file"]') : null;
   var dropped = null;
+  var s = document.getElementById('srcName');
+  var clr = document.getElementById('srcClear');
+  function showFile(name) {
+    if (s) s.textContent = name ? '選択中: ' + name : '';
+    if (clr) clr.style.display = name ? '' : 'none';
+  }
+  if (input) input.addEventListener('change', function () {
+    dropped = null;
+    showFile(input.files && input.files[0] ? input.files[0].name : '');
+  });
+  if (clr) clr.addEventListener('click', function () {
+    dropped = null;
+    if (input) input.value = '';
+    showFile('');
+  });
   window.addEventListener('drop', function (e) {
     if (!hasFiles(e)) return;
     e.preventDefault();
@@ -220,8 +235,7 @@ DROP_SCRIPT_INDEX = (
     if (!f || !input) return;
     dropped = f;
     try { input.files = e.dataTransfer.files; } catch (err) {}
-    var s = document.getElementById('srcName');
-    if (s) s.textContent = '選択中: ' + f.name;
+    showFile(f.name);
   });
   if (form) form.addEventListener('submit', function (e) {
     if (dropped && input && (!input.files || !input.files.length)) {
@@ -259,7 +273,7 @@ def index():
     <div class='row'>タイトル<input type='text' name='title' required></div>
     <div class='row'>欲しい内容<textarea name='request' rows='5'></textarea></div>
     <div class='row'>設定資料<textarea name='settings' rows='5'></textarea></div>
-    <div class='row'>素材テキスト（任意・作成と同時にアップロード）<input type='file' name='source_file' accept='.txt,.md,.text,text/plain'> <span id='srcName'></span>（画面へドラッグ＆ドロップでもセットできます）</div>
+    <div class='row'>素材テキスト（任意・作成と同時にアップロード）<input type='file' name='source_file' accept='.txt,.md,.text,text/plain'> <span id='srcName'></span> <button type='button' id='srcClear' style='display:none;background:#b03a3a;border-color:#b03a3a'>選択を削除</button>（画面へドラッグ＆ドロップでもセットできます）</div>
     <div class='row'>章数<input type='text' name='num_chapters' value='3' style='width:4em'></div>
     <div class='row'>章の最低文字数<select name='min_chars'>""" + min_chars_options(0) + """</select>
     （届かない場合は自動で続きを書き足します）</div>
