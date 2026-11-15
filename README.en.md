@@ -2,11 +2,13 @@
 
 [Japanese README](README.md) / Design document: `DESIGN.md` (Japanese)
 
+Prebuilt image (Docker Hub): https://hub.docker.com/r/yuichi894/novel-harness
+
 ## Overview
 
 A controller container that runs novel generation **entirely on your local network**. It lives on a Synology NAS and drives an inference PC (XeStrata / Strata) over its OpenAI-compatible API, managing the whole pipeline from per-chapter generation to revision and combined output. No manuscript text is ever sent to an external service, so there is no account-suspension (ban) risk.
 
-**It runs straight from the Synology Container Manager GUI.** Download the image, start the container, then enter the inference server's address in the web settings page. No terminal work and no environment-variable editing required.
+**It runs straight from the Synology Container Manager GUI:** start the image, then enter the inference server's address in the web settings page. No terminal or environment-variable editing required.
 
 ### Workspaces and pipeline
 
@@ -26,7 +28,7 @@ The harness does not pin model names. Every request uses whatever model the infe
 
 ### GUI (AnythingLLM-style layout)
 
-A left sidebar always lists the workspaces and the chapters of the open workspace; the main area runs the pipeline. Chapters can also be deleted from the sidebar (✕). While a job runs, the work page refreshes itself and shows each job's elapsed time and token usage as a meter (`thinking: X of budget B (max M) tokens`). Jobs interrupted by a container restart are recovered as failed, with the reason shown. A per-work minimum chapter length (5,000–50,000 characters) can be set; if a draft comes up short, the harness automatically writes continuations until it reaches the minimum (up to 5 rounds). The Context Window can be set to 64k / 128k / 256k / 512k, and the per-stage Max Tokens defaults are generous.
+A left sidebar always lists the workspaces and the chapters of the open workspace; the main area runs the pipeline. Chapters can also be deleted from the sidebar (✕). While a job runs, the work page refreshes itself and shows each job's elapsed time and a token-usage (thinking) meter. Jobs interrupted by a container restart are recovered as failed, with the reason shown. A per-work minimum chapter length (5,000–50,000 characters) can be set; short drafts are automatically continued until they reach it (up to 5 rounds). The Context Window can be set to 64k / 128k / 256k / 512k.
 
 Each chapter also has its own **chapter page** (outline → generated text → **Think** (the model's reasoning, returned as `reasoning_content`) → state → revision notes). Writing **revision notes** on the chapter page and pressing the button regenerates just that chapter with the notes included. For continuation writing, a **state chain** keeps the story state explicit: right after the initial document analysis, the harness outputs the "current state" at the end of the source document (location, character states, relationships, ongoing events, unresolved threads); every chapter receives the state at its start as input and outputs its end state for the next chapter. Each chapter's input/output state can be inspected on its chapter page.
 

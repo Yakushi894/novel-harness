@@ -2,11 +2,13 @@
 
 [English README](README.en.md) / 設計書：`DESIGN.md`
 
+配布イメージ（Docker Hub）： https://hub.docker.com/r/yuichi894/novel-harness
+
 ## 概要
 
 小説生成を **全ローカルで完結**させるための司令塔コンテナです。Synology NAS 上に常駐し、LAN 内の推論 PC（XeStrata / Strata）の OpenAI 互換 API を呼んで、章ごとの生成から改修、結合出力までを工程として管理します。外部サービスへ本文を送らないため、アカウント停止（BAN）リスクがありません。
 
-**Synology Container Manager の GUI からそのまま動かせます。** イメージをダウンロードして起動し、あとはブラウザの設定画面で接続先を入れるだけです。ターミナル操作も環境変数の編集も不要です。
+**Synology Container Manager の GUI からそのまま動かせます。** イメージを起動し、ブラウザの設定画面で接続先を入れるだけです（ターミナル操作・環境変数の編集は不要）。
 
 ### ワークスペースと工程
 
