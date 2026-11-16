@@ -284,18 +284,29 @@ def chapter_chars(work_id, chapter_id):
 
 
 def ensure_min_chars(job, work, ch, body):
-    """本文が最低文字数に届くまで、続きを自動で書き足す（最大5回）。
+    """本文が最低文字数に届くまで、続きを自動で書き足す。
 
-    届かなくてもエラーにはせず、その時点の本文を返す（進捗は下書きに保存する）。
+    v1.12 で仕様変更：従来は最大5回で打ち切り、届かなくてもそのまま
+    「生成済み／完成」にしていたため、最低2万字でも1万字程度で完了して
+    しまった（1回の書き足しで得られるのは実測1,000〜2,000字程度）。
+    - 回数上限は目標から見積もる（1,000字あたり1回＋余裕、下限10回・上限30回）
+    - 各回に「今回書き足す最低文字数（不足分と3,000字の小さい方）」を明示し、
+      届くまでは章を終わらせないよう指示する
+    - 書き足しが進まなくなった（300字未満が2回連続）ら打ち切る
+    - それでも届かなければ、下書きを保存し、章を再実行可能な状態に戻して
+      エラーにする（完成扱いにしない）。キャンセル時は従来どおり本文を返す。
     """
     target = work_min_chars(work)
     if target <= 0:
         return body
+    max_rounds = min(30, max(10, -(-target // 1000)))
     rounds = 0
-    while len(body) < target and rounds < 5:
+    stalls = 0
+    while len(body) < target and rounds < max_rounds:
         if _cancelled(job):
-            break
+            return body
         rounds += 1
+        need = target - len(body)
         extra = llm.chat(
             "auto", prompts.CONTINUE_SYSTEM + sys_note(work),
             prompts.CONTINUE_USER.format(
@@ -303,14 +314,28 @@ def ensure_min_chars(job, work, ch, body):
                 outlines=outlines_text(work),
                 summaries=summaries_text(work, ch["number"]),
                 tail=body[-2500:],
-                current=len(body), target=target),
+                current=len(body), target=target,
+                need=need, round_min=min(need, 3000)),
             max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
             temperature=temperature())
         extra = (extra or "").strip()
-        if not extra:
-            break
-        body = body.rstrip() + "\n" + extra
+        if extra:
+            body = body.rstrip() + "\n" + extra
+            save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+        if len(extra) < 300:
+            stalls += 1
+            if stalls >= 2:
+                break
+        else:
+            stalls = 0
+    if len(body) < target:
         save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+        msg = (f"第{ch['number']}章が最低文字数に届きませんでした"
+               f"（{len(body)} / {target}文字、書き足し{rounds}回で打ち切り）。"
+               "完成扱いにせず下書きを保存しました。工程を再実行してください。")
+        add_notice(work, msg)
+        set_chapter_status(ch["id"], "outlined")
+        raise RuntimeError(msg)
     return body
 
 
@@ -445,6 +470,13 @@ def revise_chapters(job, work, chapters, model_changed=False):
                 number=ch["number"], title=ch["title"], text=body),
             max_tokens=revise_max_tokens(model_changed),
             temperature=temperature())
+        target = work_min_chars(work)
+        if target > 0 and len(revised) < target:
+            msg = (f"第{ch['number']}章の2次修正後の本文が最低{target}文字を下回りました"
+                   f"（修正後{len(revised)}文字／1次出力{len(body)}文字）。"
+                   "校正で短くなった可能性があります。章ページで文字数を確認してください。")
+            add_notice(work, msg)
+            notify(f"【小説ハーネス】「{work['title']}」{msg}")
         save_artifact(work, ch, "revised", f"ch{ch['number']:03d}.txt", revised)
         save_artifact(work, ch, "final", f"ch{ch['number']:03d}.txt", revised)
         set_chapter_status(ch["id"], "final")
