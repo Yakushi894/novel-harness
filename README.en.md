@@ -6,19 +6,19 @@ Prebuilt image (Docker Hub): https://hub.docker.com/r/yuichi894/novel-harness
 
 ## Overview
 
-A controller container that runs novel generation **entirely on your local network**. It lives on a Synology NAS and drives an inference PC (XeStrata / Strata) over its OpenAI-compatible API, managing the whole pipeline from per-chapter generation to revision and combined output. No manuscript text is ever sent to an external service, so there is no account-suspension (ban) risk.
+A controller container that runs novel generation **entirely on your local network**. It lives on a Synology NAS and drives an inference PC (XeStrata / Strata) over its OpenAI-compatible API, managing everything from per-chapter generation to revision and combined output. No manuscript text is ever sent to an external service, so there is no account-suspension (ban) risk.
 
-**It runs straight from the Synology Container Manager GUI:** start the image, then enter the inference server's address in the web settings page. No terminal or environment-variable editing required.
+**It runs straight from the Synology Container Manager GUI:** start the image, then enter the server's address in the web settings page. No terminal required.
 
 ### Workspaces and pipeline
 
 Workspaces are **per story**: one workspace per story/document; a new story gets its own workspace. Each workspace follows a fixed pipeline:
 
-1. **Load source**: Enter the concept and setting documents, or upload an existing text file (e.g. .txt) as source material — the starting point for generating a continuation. Uploaded documents can be run through **initial document analysis**: the model extracts a foundation brief (premise, characters, plot so far, style and viewpoint, open threads) that is then included in every later generation step.
-2. **Next-chapter content**: Generate an outline for every chapter in one pass, then edit and approve the outlines in the Web UI.
+1. **Load source**: Enter the concept and settings, or upload an existing text file (e.g. .txt) as source material for a continuation. Uploaded documents can be run through **initial document analysis**: the model extracts a foundation brief (premise, characters, plot so far, style and viewpoint, open threads) that is then included in every later generation step.
+2. **Next-chapter content**: Generate all chapter outlines in one pass, then edit and approve them in the Web UI.
 3. **First pass (draft)**: Before writing each chapter, a *prompt-design layer* produces a chapter-specific instruction sheet (style and viewpoint consistency, how to pick up the previous flow, elements to include or avoid), and the chapter is written from it. Each finished chapter is summarized and the summary is fed into the next chapter's context (summary chaining).
 4. **Second pass (revision)**: Once all chapters exist, the container posts "please switch the model" to Synology Chat. When the model on the inference server changes, the container detects it via `/v1/models` and starts the revision automatically. **The wait has no timeout** — if the notification is missed overnight, the generated drafts stay put and work resumes when the switch happens (with re-notifications).
-   - The second pass is a **proofreading** pass: it must not change the overall meaning, content, or plot. It only fixes particles and grammar, typos, unnatural Japanese, and stray Chinese/English mixed into the text (converted to Japanese) — except lines where a foreign character naturally speaks that language, which are left as-is.
+   - The second pass is a **proofreading** pass: it must not change the overall meaning, content, or plot. It only fixes particles and grammar, typos, unnatural Japanese, and stray Chinese/English mixed into the text (converted to Japanese) — except a foreign character's own lines, which are left as-is.
    - **Thread mode (no switching)** is also available per work: with the model chosen at the start, each chapter runs in its own thread (independent context) from draft to finishing revision. Each thread receives the uploaded TXT and the chapter outlines, but not other chapters' body text, which keeps the context short.
 5. **PHP / TXT output**: A small PHP page (Synology Web Station) concatenates the final chapters for on-screen reading and .txt download.
 
@@ -28,9 +28,13 @@ The harness does not pin model names. Every request uses whatever model the infe
 
 ### GUI (AnythingLLM-style layout)
 
-A left sidebar always lists the workspaces and the chapters of the open workspace; the main area runs the pipeline. Chapters can also be deleted from the sidebar (✕). While a job runs, the work page refreshes itself and shows each job's elapsed time and a token-usage (thinking) meter. Jobs interrupted by a container restart are recovered as failed, with the reason shown. A per-work minimum chapter length (5,000–50,000 characters) can be set; drafts are continued until they reach it; failing that, the job errors instead of completing. The Context Window can be set to 64k / 128k / 256k / 512k.
+A left sidebar always lists the workspaces and the chapters of the open workspace; the main area runs the pipeline. Chapters can also be deleted from the sidebar (✕). While a job runs, the work page auto-refreshes and shows elapsed time and a token-usage (thinking) meter. Jobs interrupted by a container restart are recovered as failed, with the reason shown. A per-work minimum chapter length (5,000–50,000 characters) can be set; drafts are continued until they reach it; failing that, the job errors instead of completing. The Context Window can be set to 64k / 128k / 256k / 512k.
 
-Each chapter also has its own **chapter page** (outline → generated text → **Think** (the model's reasoning, returned as `reasoning_content`) → state → revision notes). Writing **revision notes** on the chapter page and pressing the button regenerates just that chapter with the notes included. For continuation writing, a **state chain** keeps the story state explicit: right after the initial document analysis, the harness outputs the "current state" at the end of the source document (location, character states, relationships, ongoing events, unresolved threads); every chapter receives the state at its start as input and outputs its end state for the next chapter. Each chapter's input/output state can be inspected on its chapter page.
+### Loop detection
+
+If the body or Think output starts repeating while generating, reception stops immediately and the job fails. The looping text is not saved as the body; an incident log with details and a tail excerpt is kept in the artifacts and on the chapter page.
+
+Each chapter also has its own **chapter page** (outline → generated text → **Think** (the model's reasoning, returned as `reasoning_content`) → state → revision notes). Writing **revision notes** on the chapter page and pressing the button regenerates just that chapter with the notes included. For continuation writing, a **state chain** keeps the story state explicit: right after the initial analysis, the harness outputs the source document's end-of-text "current state" (location, character states, relationships, ongoing events, unresolved threads); each chapter takes its start state as input and outputs its end state for the next. Each chapter's input/output state can be inspected on its chapter page.
 
 ### Web search and derivative-work mode
 
@@ -38,7 +42,7 @@ A web search mode covers words the local model doesn't know — new terms and co
 
 - **Term lookup**: enter a word and the harness checks Japanese Wiktionary / Wikipedia / the web, saves a "term memo", and includes it in later generation.
 - **Term check (automatic)**: before outline and draft generation, the model itself flags words it doesn't know; terms missing from the glossary DB are looked up and added, with a notice on the work page.
-- **Glossary DB**: learned meanings are stored in a dictionary separate from workspaces. **They survive workspace deletion**, and the same word in another story reuses the memo instead of searching again (manage it from the sidebar's Glossary DB page).
+- **Glossary DB**: learned meanings are stored in a dictionary separate from workspaces. **They survive workspace deletion** and are reused by other stories (manage them from the sidebar's Glossary DB page).
 - **Derivative-work (fanfiction) mode**: a per-work ON/OFF toggle (can be hidden in Settings; shown by default). When ON, the AI is told the work is derivative. When OFF, it judges from the text alone.
 - **Character profile search** (when derivative mode is ON): gathers public material for a character and summarizes it into a profile — first-person pronoun, forms of address, speech endings, catchphrases, mannerisms, behavior — which is then included in generation.
 

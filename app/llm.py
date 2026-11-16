@@ -2,8 +2,15 @@
 
 接続先URLとAPIキーは Web UI の設定画面（DB）優先、環境変数は初期値として使う。
 GUI からコンテナを起動しただけでも、後から画面で設定できるようにするため。
+
+生成は原則ストリーミングで受け、本文・thinking の繰り返しループを生成中に
+検出したら即座に接続を切って LoopDetectedError で異常終了する（v1.13〜）。
+ストリーミング非対応のサーバーでは従来の一括受信に自動でフォールバックし、
+そちらでも受信後に同じループ検査を行う。
 """
+import json
 import os
+import re
 import time
 
 import httpx
@@ -43,6 +50,67 @@ USAGE_SINK = None
 # 直近の chat() 呼び出しでモデルが返した thinking（思考過程）。
 # XeStrata は message.reasoning_content に入れて返す。本文とは分けて保持する。
 LAST_THINKING = ""
+
+
+class LoopDetectedError(RuntimeError):
+    """生成テキスト（本文または thinking）が繰り返しループに入ったため異常終了する。
+
+    where: "本文" / "thinking"、unit: 繰り返し単位の抜粋、repeats: 推定繰り返し回数、
+    chars: 検出時点の累積文字数、content_text / think_text: 検出時点の全文（ログ用）。
+    saved_log: pipeline 側でログ成果物を保存済みなら True（二重保存防止）。
+    """
+
+    def __init__(self, where, info, content_text, think_text):
+        self.where = where
+        self.unit = info.get("unit", "")
+        self.repeats = info.get("repeats", 0)
+        self.chars = info.get("chars", 0)
+        self.content_text = content_text or ""
+        self.think_text = think_text or ""
+        self.saved_log = False
+        unit_disp = self.unit.replace("\n", " ")[:40]
+        super().__init__(
+            f"生成ループを検出したため異常終了しました（対象：{where}、"
+            f"繰り返し単位「{unit_disp}…」が約{self.repeats}回、{self.chars}文字時点で検出）")
+
+
+def detect_loop(text):
+    """テキスト末尾の繰り返しループを検出する。検出したら dict、なければ None。
+
+    判定は保守的（通常の小説本文・思考ではまず発火しない強さ）：
+    A) 同じ文（10字以上）が6回以上連続する
+    B) 末尾が周期 p（8〜600字）の繰り返しで、800字以上の区間がその周期で一致する
+       （繰り返し回数4回以上に相当する長さがある場合のみ）
+    """
+    if not text or len(text) < 500:
+        return None
+    tail = text[-4000:]
+    # A) 文単位の連続繰り返し
+    units = [u.strip() for u in re.split(r"(?<=[。！？])|\n", tail)]
+    units = [u for u in units if len(u) >= 10]
+    run, prev = 0, None
+    for u in units:
+        run = run + 1 if u == prev else 1
+        prev = u
+        if run >= 6:
+            return {"unit": u, "repeats": run, "chars": len(text)}
+    # B) 周期的な繰り返し（末尾区間が p 字シフトした自分自身と一致）
+    n = len(text)
+    for length in (2400, 1600, 800):
+        if n <= length:
+            continue
+        seg = text[-length:]
+        for p in range(8, 601):
+            if length < p * 4 or n - length - p < 0:
+                continue
+            if seg == text[-length - p:-p]:
+                return {"unit": text[-p:], "repeats": max(2, length // p),
+                        "chars": len(text)}
+    return None
+
+
+class _StreamUnsupported(Exception):
+    """ストリーミング受信が使えない（一括受信にフォールバックする）。"""
 
 
 def _split_thinking(message):
@@ -117,8 +185,93 @@ def current_model():
     return m if m else "strata"
 
 
+def _check_loops(content, think):
+    """本文・thinking の両方を検査し、ループがあれば LoopDetectedError を投げる。"""
+    info = detect_loop(think)
+    if info:
+        raise LoopDetectedError("thinking", info, content, think)
+    info = detect_loop(content)
+    if info:
+        raise LoopDetectedError("本文", info, content, think)
+
+
+def _chat_streaming(payload, model, max_tokens, timeout_s):
+    """ストリーミング受信。戻り値は応答 JSON 相当の dict（message を組み立て済み）。
+
+    生成中に一定量たまるたびループ検査をし、検出したら接続を切って
+    LoopDetectedError を投げる。ストリーミングが使えない応答（エラー応答、
+    空応答、SSE でない形式など）の場合は _StreamUnsupported を投げ、
+    呼び出し側が一括受信にフォールバックする。
+    """
+    body = dict(payload)
+    body["stream"] = True
+    body["stream_options"] = {"include_usage": True}
+    content_parts, think_parts = [], []
+    content_len = think_len = 0
+    checked_content = checked_think = 0
+    usage = None
+    chunks = 0
+    try:
+        with httpx.Client(timeout=timeout_s) as client:
+            with client.stream("POST", f"{base_url()}/v1/chat/completions",
+                               headers=_headers(), json=body) as r:
+                if r.status_code != 200:
+                    r.read()
+                    raise _StreamUnsupported(f"status {r.status_code}")
+                if "application/json" in (r.headers.get("content-type") or ""):
+                    # ストリーム指定を無視して一括 JSON が返ってきた場合はそのまま使う
+                    j = json.loads(r.read().decode("utf-8"))
+                    return j
+                for line in r.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    chunks += 1
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    c = delta.get("content") or ""
+                    t = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    if c:
+                        content_parts.append(c)
+                        content_len += len(c)
+                    if t:
+                        think_parts.append(t)
+                        think_len += len(t)
+                    if content_len - checked_content >= 800 or think_len - checked_think >= 800:
+                        checked_content, checked_think = content_len, think_len
+                        _check_loops("".join(content_parts), "".join(think_parts))
+    except (LoopDetectedError, _StreamUnsupported):
+        raise
+    except httpx.HTTPError as e:
+        if chunks == 0 and not content_parts and not think_parts:
+            raise _StreamUnsupported(str(e))
+        raise RuntimeError(f"ストリーミング受信が中断しました：{e}")
+    if chunks == 0 and not content_parts and not think_parts:
+        raise _StreamUnsupported("empty stream")
+    j = {"model": model,
+         "choices": [{"message": {"content": "".join(content_parts),
+                                  "reasoning_content": "".join(think_parts)}}]}
+    if usage:
+        j["usage"] = usage
+    return j
+
+
 def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0):
-    """1回のチャット補完を行い、本文テキストを返す。model=None/'auto' ならロード中モデルを使う。"""
+    """1回のチャット補完を行い、本文テキストを返す。model=None/'auto' ならロード中モデルを使う。
+
+    本文または thinking が繰り返しループに入った場合は LoopDetectedError で
+    異常終了する（生成中のストリーミング検査＋受信後の検査）。
+    """
     global LAST_THINKING
     if model in (None, "", "auto"):
         model = current_model()
@@ -143,13 +296,17 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
     rb = reasoning_budget()
     if rb > 0:
         payload["reasoning_budget_tokens"] = rb
-    with httpx.Client(timeout=timeout_s) as client:
-        r = client.post(f"{base_url()}/v1/chat/completions", headers=_headers(), json=payload)
-        r.raise_for_status()
-        j = r.json()
+    try:
+        j = _chat_streaming(payload, model, max_tokens, timeout_s)
+    except _StreamUnsupported:
+        with httpx.Client(timeout=timeout_s) as client:
+            r = client.post(f"{base_url()}/v1/chat/completions", headers=_headers(), json=payload)
+            r.raise_for_status()
+            j = r.json()
     _report_usage(j, max_tokens)
     content, think = _split_thinking(j["choices"][0]["message"])
     LAST_THINKING = think
+    _check_loops(content, think)
     return content
 
 

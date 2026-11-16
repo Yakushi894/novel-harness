@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.12"
+APP_VERSION = "1.13"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -523,7 +523,9 @@ def work_detail(work_id: int):
             + usage_html(j))
     job_html = job_rows
     art_html = "".join(
-        f"<div><a href='/artifacts/{a['id']}'>{esc(a['kind'])}</a> {esc(a['path'])}"
+        f"<div><a href='/artifacts/{a['id']}'>"
+        + ("log（異常終了ログ）" if a["kind"] == "log" else esc(a["kind"]))
+        + f"</a> {esc(a['path'])}"
         + (f" <form method='post' action='/artifacts/{a['id']}/delete' style='display:inline'><button>削除</button></form>"
            if a["kind"] in ("glossary", "character", "analysis", "source") else "") + "</div>"
         for a in arts)
@@ -758,6 +760,7 @@ def chapter_page(chapter_id: int):
     body_art = final or draft
     body_label = "本文（2次修正済み）" if final else "本文（1次出力）"
     think = pipeline.latest_artifact(w["id"], ch["id"], "think")
+    loop_log = pipeline.latest_artifact(w["id"], ch["id"], "log")
     design = pipeline.latest_artifact(w["id"], ch["id"], "prompt")
     in_state = pipeline.current_state(w, ch["number"])
     out_state = pipeline.chapter_end_state(w, ch)
@@ -774,6 +777,8 @@ def chapter_page(chapter_id: int):
                  if body_art else "<p>まだ生成されていません。</p>")
     think_html = (f"<div class='card'><h2>Think（思考過程）</h2>"
                   f"<pre>{esc(pipeline.read_text(think['path']))}</pre></div>") if think else ""
+    loop_log_html = (f"<div class='card' style='border:2px solid #b03a3a'><h2>異常終了ログ（生成ループ）</h2>"
+                     f"<pre>{esc(pipeline.read_text(loop_log['path']))}</pre></div>") if loop_log else ""
     design_html = (f"<details class='card'><summary>生成指示書</summary>"
                    f"<pre>{esc(pipeline.read_text(design['path']))}</pre></details>") if design else ""
     state_html = ""
@@ -795,6 +800,7 @@ def chapter_page(chapter_id: int):
     <div class='card'><h2>{body_label}</h2>
     <p>文字数：{chars}文字{'（最低' + str(min_chars) + '文字）' if min_chars > 0 else ''} ／ 状態：{esc(ch['status'])}</p>
     {body_html}</div>
+    {loop_log_html}
     {think_html}
     {design_html}
     {state_html}

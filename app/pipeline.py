@@ -102,7 +102,7 @@ def tail_chars():
 
 def work_dir(slug):
     d = os.path.join(WORKS_DIR, slug)
-    for sub in ("source", "prompts", "drafts", "summaries", "revised", "final", "states", "thinking"):
+    for sub in ("source", "prompts", "drafts", "summaries", "revised", "final", "states", "thinking", "logs"):
         os.makedirs(os.path.join(d, sub), exist_ok=True)
     return d
 
@@ -111,7 +111,7 @@ def save_artifact(work, chapter, kind, filename, text):
     d = work_dir(work["slug"])
     sub = {"source": "source", "analysis": "source", "glossary": "source", "character": "source",
            "prompt": "prompts", "draft": "drafts", "state": "states", "think": "thinking",
-           "summary": "summaries", "revised": "revised", "final": "final"}[kind]
+           "summary": "summaries", "revised": "revised", "final": "final", "log": "logs"}[kind]
     path = os.path.join(d, sub, filename)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -251,6 +251,43 @@ def save_think(work, ch):
     think = (llm.LAST_THINKING or "").strip()
     if think:
         save_artifact(work, ch, "think", f"ch{ch['number']:03d}_think.txt", think)
+
+
+def save_loop_log(work, ch, stage_label, err):
+    """生成ループによる異常終了のログを成果物（kind=log）として保存する。
+
+    成果物欄と章ページから開いて状況確認できるようにするためのもの。
+    ループした本文そのものは成果物（draft/final）にせず、このログ末尾に
+    抜粋としてだけ残す。
+    """
+    import datetime
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ch_label = f"第{ch['number']}章 {ch['title']}" if ch else "（章なし）"
+    lines = [
+        "# 異常終了ログ（生成ループ検出）",
+        f"日時：{now}",
+        f"作品：{work['title']}",
+        f"章：{ch_label}",
+        f"工程：{stage_label}",
+        f"使用モデル：{llm.loaded_model() or '不明'}",
+        f"検出対象：{err.where}",
+        f"繰り返し単位（抜粋）：{err.unit[:200]}",
+        f"推定繰り返し回数：約{err.repeats}回",
+        f"検出時点の累積文字数：{err.chars}文字（本文{len(err.content_text)}文字／thinking {len(err.think_text)}文字）",
+        "",
+        "この工程は異常終了しました。ループしたテキストは本文の成果物として保存していません。",
+        "状況確認のため、ループしたテキストの末尾抜粋を以下に残します。工程を再実行してください。",
+        "",
+        "## ループした本文（末尾2000字）",
+        err.content_text[-2000:] or "（本文はまだ出力されていませんでした）",
+        "",
+        "## ループした thinking（末尾2000字）",
+        err.think_text[-2000:] or "（thinking はありませんでした）",
+    ]
+    fname = f"ch{ch['number']:03d}_loop.txt" if ch else "loop.txt"
+    path = save_artifact(work, ch, "log", fname, "\n".join(lines))
+    err.saved_log = True
+    return path
 
 
 def set_stage(work_id, stage):
@@ -417,33 +454,38 @@ def do_generate_chapters(job, work):
         if ch["status"] == "generated":
             continue
         set_chapter_status(ch["id"], "generating")
-        instruction = design_prompt(work, ch, work["request"])
-        used_model = llm.current_model()
-        prev_state = current_state(work, ch["number"])
-        body = llm.chat(
-            "auto", prompts.CHAPTER_SYSTEM + sys_note(work),
-            prompts.CHAPTER_USER.format(
-                instruction=instruction, settings=settings_text(work),
-                state=prev_state,
-                outlines=outlines_text(work),
-                summaries=summaries_text(work, ch["number"]),
-                prev_tail=prev_tail(work, ch["number"]),
-                number=ch["number"], title=ch["title"], outline=ch["outline"],
-                min_chars_note=min_chars_note(work)),
-            max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
-            temperature=temperature())
-        save_think(work, ch)
-        body = ensure_min_chars(job, work, ch, body)
-        save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
-        db.set_setting(f"work:{work['id']}:draft_model", used_model)
-        update_state(work, ch, body, prev_state)
-        summary = llm.chat(
-            "auto", prompts.SUMMARY_SYSTEM,
-            prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
-            max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-            temperature=temperature())
-        save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
-        set_chapter_status(ch["id"], "generated")
+        try:
+            instruction = design_prompt(work, ch, work["request"])
+            used_model = llm.current_model()
+            prev_state = current_state(work, ch["number"])
+            body = llm.chat(
+                "auto", prompts.CHAPTER_SYSTEM + sys_note(work),
+                prompts.CHAPTER_USER.format(
+                    instruction=instruction, settings=settings_text(work),
+                    state=prev_state,
+                    outlines=outlines_text(work),
+                    summaries=summaries_text(work, ch["number"]),
+                    prev_tail=prev_tail(work, ch["number"]),
+                    number=ch["number"], title=ch["title"], outline=ch["outline"],
+                    min_chars_note=min_chars_note(work)),
+                max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
+                temperature=temperature())
+            save_think(work, ch)
+            body = ensure_min_chars(job, work, ch, body)
+            save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+            db.set_setting(f"work:{work['id']}:draft_model", used_model)
+            update_state(work, ch, body, prev_state)
+            summary = llm.chat(
+                "auto", prompts.SUMMARY_SYSTEM,
+                prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
+                max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
+                temperature=temperature())
+            save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
+            set_chapter_status(ch["id"], "generated")
+        except llm.LoopDetectedError as e:
+            save_loop_log(work, ch, "1次出力", e)
+            set_chapter_status(ch["id"], "outlined")
+            raise
     set_stage(work["id"], "wait_model")
     notify(f"【小説ハーネス】「{work['title']}」の1次出力が終了しました（使用モデル：{llm.loaded_model()}）。"
            "2次修正に使うモデルへ切り替えて下さい。")
@@ -463,13 +505,18 @@ def revise_chapters(job, work, chapters, model_changed=False):
         set_chapter_status(ch["id"], "revising")
         draft = latest_artifact(work["id"], ch["id"], "draft")
         body = read_text(draft["path"]) if draft else ""
-        revised = llm.chat(
-            "auto", prompts.REVISE_SYSTEM + sys_note(work),
-            prompts.REVISE_USER.format(
-                settings=settings_text(work, ctx=eff_ctx), outlines=outlines_text(work),
-                number=ch["number"], title=ch["title"], text=body),
-            max_tokens=revise_max_tokens(model_changed),
-            temperature=temperature())
+        try:
+            revised = llm.chat(
+                "auto", prompts.REVISE_SYSTEM + sys_note(work),
+                prompts.REVISE_USER.format(
+                    settings=settings_text(work, ctx=eff_ctx), outlines=outlines_text(work),
+                    number=ch["number"], title=ch["title"], text=body),
+                max_tokens=revise_max_tokens(model_changed),
+                temperature=temperature())
+        except llm.LoopDetectedError as e:
+            save_loop_log(work, ch, "2次修正", e)
+            set_chapter_status(ch["id"], "generated")
+            raise
         target = work_min_chars(work)
         if target > 0 and len(revised) < target:
             msg = (f"第{ch['number']}章の2次修正後の本文が最低{target}文字を下回りました"
@@ -500,33 +547,38 @@ def do_generate_thread(job, work):
             return
         if ch["status"] != "generated":
             set_chapter_status(ch["id"], "generating")
-            instruction = design_prompt(work, ch, work["request"], use_tail=False)
-            used_model = llm.current_model()
-            prev_state = current_state(work, ch["number"])
-            body = llm.chat(
-                "auto", prompts.CHAPTER_SYSTEM + sys_note(work),
-                prompts.CHAPTER_USER.format(
-                    instruction=instruction, settings=settings_text(work),
-                    state=prev_state,
-                    outlines=outlines_text(work),
-                    summaries=summaries_text(work, ch["number"]),
-                    prev_tail="",
-                    number=ch["number"], title=ch["title"], outline=ch["outline"],
-                    min_chars_note=min_chars_note(work)),
-                max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
-                temperature=temperature())
-            save_think(work, ch)
-            body = ensure_min_chars(job, work, ch, body)
-            save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
-            db.set_setting(f"work:{work['id']}:draft_model", used_model)
-            update_state(work, ch, body, prev_state)
-            summary = llm.chat(
-                "auto", prompts.SUMMARY_SYSTEM,
-                prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
-                max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-                temperature=temperature())
-            save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
-            set_chapter_status(ch["id"], "generated")
+            try:
+                instruction = design_prompt(work, ch, work["request"], use_tail=False)
+                used_model = llm.current_model()
+                prev_state = current_state(work, ch["number"])
+                body = llm.chat(
+                    "auto", prompts.CHAPTER_SYSTEM + sys_note(work),
+                    prompts.CHAPTER_USER.format(
+                        instruction=instruction, settings=settings_text(work),
+                        state=prev_state,
+                        outlines=outlines_text(work),
+                        summaries=summaries_text(work, ch["number"]),
+                        prev_tail="",
+                        number=ch["number"], title=ch["title"], outline=ch["outline"],
+                        min_chars_note=min_chars_note(work)),
+                    max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
+                    temperature=temperature())
+                save_think(work, ch)
+                body = ensure_min_chars(job, work, ch, body)
+                save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+                db.set_setting(f"work:{work['id']}:draft_model", used_model)
+                update_state(work, ch, body, prev_state)
+                summary = llm.chat(
+                    "auto", prompts.SUMMARY_SYSTEM,
+                    prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
+                    max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
+                    temperature=temperature())
+                save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
+                set_chapter_status(ch["id"], "generated")
+            except llm.LoopDetectedError as e:
+                save_loop_log(work, ch, "スレッド生成", e)
+                set_chapter_status(ch["id"], "outlined")
+                raise
             ch = dict(ch, status="generated")
         if not revise_chapters(job, work, [ch]):
             return
@@ -728,6 +780,7 @@ def do_regen_chapter(job, work):
     if not ch:
         raise RuntimeError("再生成する章が見つかりません。")
     notes = (payload.get("notes") or "").strip()
+    prev_status = ch["status"]
     set_chapter_status(ch["id"], "generating")
     design = latest_artifact(work["id"], ch["id"], "prompt")
     base_instruction = read_text(design["path"]) if design else ""
@@ -735,36 +788,41 @@ def do_regen_chapter(job, work):
     if notes:
         instruction = (instruction + f"\n\n【修正要綱】\n{notes}").strip()
     prev_state = current_state(work, ch["number"])
-    body = llm.chat(
-        "auto", prompts.CHAPTER_SYSTEM + sys_note(work),
-        prompts.CHAPTER_USER.format(
-            instruction=instruction, settings=settings_text(work),
-            state=prev_state,
-            outlines=outlines_text(work),
-            summaries=summaries_text(work, ch["number"]),
-            prev_tail=prev_tail(work, ch["number"]) if work_mode(work) != "thread" else "",
-            number=ch["number"], title=ch["title"], outline=ch["outline"],
-            min_chars_note=min_chars_note(work)),
-        max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
-        temperature=temperature())
-    save_think(work, ch)
-    body = ensure_min_chars(job, work, ch, body)
-    save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
-    for kind in ("revised", "final"):
-        for a in db.q("SELECT * FROM artifacts WHERE work_id=? AND chapter_id=? AND kind=?",
-                      (work["id"], ch["id"], kind)):
-            try:
-                os.remove(a["path"])
-            except OSError:
-                pass
-            db.run("DELETE FROM artifacts WHERE id=?", (a["id"],))
-    update_state(work, ch, body, prev_state)
-    summary = llm.chat(
-        "auto", prompts.SUMMARY_SYSTEM,
-        prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
-        max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-        temperature=temperature())
-    save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
+    try:
+        body = llm.chat(
+            "auto", prompts.CHAPTER_SYSTEM + sys_note(work),
+            prompts.CHAPTER_USER.format(
+                instruction=instruction, settings=settings_text(work),
+                state=prev_state,
+                outlines=outlines_text(work),
+                summaries=summaries_text(work, ch["number"]),
+                prev_tail=prev_tail(work, ch["number"]) if work_mode(work) != "thread" else "",
+                number=ch["number"], title=ch["title"], outline=ch["outline"],
+                min_chars_note=min_chars_note(work)),
+            max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
+            temperature=temperature())
+        save_think(work, ch)
+        body = ensure_min_chars(job, work, ch, body)
+        save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+        for kind in ("revised", "final"):
+            for a in db.q("SELECT * FROM artifacts WHERE work_id=? AND chapter_id=? AND kind=?",
+                          (work["id"], ch["id"], kind)):
+                try:
+                    os.remove(a["path"])
+                except OSError:
+                    pass
+                db.run("DELETE FROM artifacts WHERE id=?", (a["id"],))
+        update_state(work, ch, body, prev_state)
+        summary = llm.chat(
+            "auto", prompts.SUMMARY_SYSTEM,
+            prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
+            max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
+            temperature=temperature())
+        save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
+    except llm.LoopDetectedError as e:
+        save_loop_log(work, ch, "章の再生成", e)
+        set_chapter_status(ch["id"], prev_status)
+        raise
     set_chapter_status(ch["id"], "generated")
     notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章を修正要綱つきで再生成しました。")
 
@@ -824,6 +882,13 @@ def worker_loop():
                 db.run("UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
                        (str(e)[:500], db.now(), job["id"]))
                 if work:
+                    if isinstance(e, llm.LoopDetectedError) and not e.saved_log:
+                        # 章に紐づかない工程（概要・解析・状態・要約など）でループした場合は
+                        # 作品レベルの異常終了ログを成果物に残す
+                        try:
+                            save_loop_log(work, None, job["kind"], e)
+                        except Exception:
+                            traceback.print_exc()
                     set_stage(work["id"], "failed")
                     notify(f"【小説ハーネス】「{work['title']}」の工程でエラーが発生しました：{str(e)[:200]}")
             finally:
