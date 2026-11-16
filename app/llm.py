@@ -47,6 +47,24 @@ def _headers():
 # ジョブ実行中、pipeline がここに集計用コールバックを設定する（usage の記録用）。
 USAGE_SINK = None
 
+# ジョブ実行中、pipeline がここに「取消要求があるか」を返すコールバックを設定する。
+# chat() は生成中もこれを定期的に確認し、取消されたら接続を切って
+# JobCancelledError で中断する（従来は工程の合間でしか取消が効かなかった）。
+CANCEL_CHECK = None
+
+
+class JobCancelledError(RuntimeError):
+    """ユーザーの停止（ジョブ取消）により生成を中断した。"""
+
+
+def _cancel_requested():
+    if not CANCEL_CHECK:
+        return False
+    try:
+        return bool(CANCEL_CHECK())
+    except Exception:
+        return False
+
 # 直近の chat() 呼び出しでモデルが返した thinking（思考過程）。
 # XeStrata は message.reasoning_content に入れて返す。本文とは分けて保持する。
 LAST_THINKING = ""
@@ -209,6 +227,8 @@ def _chat_streaming(payload, model, max_tokens, timeout_s):
     content_parts, think_parts = [], []
     content_len = think_len = 0
     checked_content = checked_think = 0
+    cancel_mark = 0
+    cancel_clock = time.time()
     usage = None
     chunks = 0
     try:
@@ -250,7 +270,13 @@ def _chat_streaming(payload, model, max_tokens, timeout_s):
                     if content_len - checked_content >= 800 or think_len - checked_think >= 800:
                         checked_content, checked_think = content_len, think_len
                         _check_loops("".join(content_parts), "".join(think_parts))
-    except (LoopDetectedError, _StreamUnsupported):
+                    if (content_len + think_len - cancel_mark >= 200
+                            or time.time() - cancel_clock >= 2.0):
+                        cancel_mark = content_len + think_len
+                        cancel_clock = time.time()
+                        if _cancel_requested():
+                            raise JobCancelledError("ユーザーにより停止されました")
+    except (LoopDetectedError, _StreamUnsupported, JobCancelledError):
         raise
     except httpx.HTTPError as e:
         if chunks == 0 and not content_parts and not think_parts:
@@ -264,6 +290,40 @@ def _chat_streaming(payload, model, max_tokens, timeout_s):
     if usage:
         j["usage"] = usage
     return j
+
+
+def _chat_once(payload, timeout_s):
+    """一括受信（フォールバック用）。別スレッドで待ち受け、取消されたら
+    クライアントを閉じて接続を切り、JobCancelledError で中断する。"""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            with httpx.Client(timeout=timeout_s) as client:
+                box["client"] = client
+                r = client.post(f"{base_url()}/v1/chat/completions",
+                                headers=_headers(), json=payload)
+                r.raise_for_status()
+                box["j"] = r.json()
+        except Exception as e:  # 取消で閉じた場合のエラーも含む（呼び出し側で判定）
+            box["err"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    while t.is_alive():
+        t.join(0.5)
+        if _cancel_requested():
+            client = box.get("client")
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            raise JobCancelledError("ユーザーにより停止されました")
+    if "err" in box:
+        raise box["err"]
+    return box["j"]
 
 
 def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0):
@@ -296,13 +356,12 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
     rb = reasoning_budget()
     if rb > 0:
         payload["reasoning_budget_tokens"] = rb
+    if _cancel_requested():
+        raise JobCancelledError("ユーザーにより停止されました")
     try:
         j = _chat_streaming(payload, model, max_tokens, timeout_s)
     except _StreamUnsupported:
-        with httpx.Client(timeout=timeout_s) as client:
-            r = client.post(f"{base_url()}/v1/chat/completions", headers=_headers(), json=payload)
-            r.raise_for_status()
-            j = r.json()
+        j = _chat_once(payload, timeout_s)
     _report_usage(j, max_tokens)
     content, think = _split_thinking(j["choices"][0]["message"])
     LAST_THINKING = think

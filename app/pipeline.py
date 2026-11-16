@@ -331,7 +331,8 @@ def ensure_min_chars(job, work, ch, body):
       届くまでは章を終わらせないよう指示する
     - 書き足しが進まなくなった（300字未満が2回連続）ら打ち切る
     - それでも届かなければ、下書きを保存し、章を再実行可能な状態に戻して
-      エラーにする（完成扱いにしない）。キャンセル時は従来どおり本文を返す。
+      エラーにする（完成扱いにしない）。停止時は JobCancelledError で中断する
+      （生成中の呼び出し内でも llm 側の CANCEL_CHECK により接続ごと切れる）。
     """
     target = work_min_chars(work)
     if target <= 0:
@@ -341,7 +342,7 @@ def ensure_min_chars(job, work, ch, body):
     stalls = 0
     while len(body) < target and rounds < max_rounds:
         if _cancelled(job):
-            return body
+            raise llm.JobCancelledError("ユーザーにより停止されました")
         rounds += 1
         need = target - len(body)
         extra = llm.chat(
@@ -486,6 +487,9 @@ def do_generate_chapters(job, work):
             save_loop_log(work, ch, "1次出力", e)
             set_chapter_status(ch["id"], "outlined")
             raise
+        except llm.JobCancelledError:
+            set_chapter_status(ch["id"], "outlined")
+            raise
     set_stage(work["id"], "wait_model")
     notify(f"【小説ハーネス】「{work['title']}」の1次出力が終了しました（使用モデル：{llm.loaded_model()}）。"
            "2次修正に使うモデルへ切り替えて下さい。")
@@ -515,6 +519,9 @@ def revise_chapters(job, work, chapters, model_changed=False):
                 temperature=temperature())
         except llm.LoopDetectedError as e:
             save_loop_log(work, ch, "2次修正", e)
+            set_chapter_status(ch["id"], "generated")
+            raise
+        except llm.JobCancelledError:
             set_chapter_status(ch["id"], "generated")
             raise
         target = work_min_chars(work)
@@ -577,6 +584,9 @@ def do_generate_thread(job, work):
                 set_chapter_status(ch["id"], "generated")
             except llm.LoopDetectedError as e:
                 save_loop_log(work, ch, "スレッド生成", e)
+                set_chapter_status(ch["id"], "outlined")
+                raise
+            except llm.JobCancelledError:
                 set_chapter_status(ch["id"], "outlined")
                 raise
             ch = dict(ch, status="generated")
@@ -823,6 +833,9 @@ def do_regen_chapter(job, work):
         save_loop_log(work, ch, "章の再生成", e)
         set_chapter_status(ch["id"], prev_status)
         raise
+    except llm.JobCancelledError:
+        set_chapter_status(ch["id"], prev_status)
+        raise
     set_chapter_status(ch["id"], "generated")
     notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章を修正要綱つきで再生成しました。")
 
@@ -873,10 +886,18 @@ def worker_loop():
             db.run("UPDATE jobs SET status='running', updated_at=? WHERE id=?", (db.now(), job["id"]))
             work = db.one("SELECT * FROM works WHERE id=?", (job["work_id"],))
             llm.USAGE_SINK = _usage_sink_for(job["id"])
+            llm.CANCEL_CHECK = (lambda jid: lambda: _cancelled({"id": jid}))(job["id"])
             try:
                 HANDLERS[job["kind"]](job, work)
                 if not _cancelled(job):
                     db.run("UPDATE jobs SET status='done', updated_at=? WHERE id=?", (db.now(), job["id"]))
+            except llm.JobCancelledError:
+                # ユーザーの停止：生成中の接続は llm 側で切断済み。failed にはしない。
+                db.run("UPDATE jobs SET status='cancelled', updated_at=? WHERE id=? AND status='running'",
+                       (db.now(), job["id"]))
+                if work:
+                    set_stage(work["id"], "cancelled")
+                    add_notice(work, "工程が停止ボタンで中断されました。途中まで生成された章は再実行できます。")
             except Exception as e:
                 traceback.print_exc()
                 db.run("UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
@@ -893,6 +914,7 @@ def worker_loop():
                     notify(f"【小説ハーネス】「{work['title']}」の工程でエラーが発生しました：{str(e)[:200]}")
             finally:
                 llm.USAGE_SINK = None
+                llm.CANCEL_CHECK = None
         except Exception:
             # ワーカースレッド自体は絶対に落とさない（ジョブが running のまま固まる事故を防ぐ）
             traceback.print_exc()

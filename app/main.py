@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.13"
+APP_VERSION = "1.14"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -49,6 +49,7 @@ STAGE_LABEL = {
     "revising": "4. 2次修正中",
     "done": "5. 完了（PHP・TXT化できます）",
     "failed": "エラー",
+    "cancelled": "停止済み（工程を再実行できます）",
 }
 
 FLOW_STEPS = ["1. 続き読み込み", "2. 次章の内容", "3. 1次出力", "4. 2次修正", "5. PHP・TXT化"]
