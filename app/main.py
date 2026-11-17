@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.22"
+APP_VERSION = "1.23"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -556,10 +556,16 @@ def _chapter_live_html(w, ch) -> str:
             f"<pre>{esc(partial_body)}</pre>{live_think}</div>")
 
 
+CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "revise_outline": "修正概要の作成",
+                      "outline_chapter": "概要の再生成"}
+CHAPTER_JOB_KINDS = tuple(CHAPTER_JOB_LABELS)
+
+
 def _chapter_jobs_html(jobs) -> str:
-    """章ページの再生成ジョブ一覧フラグメント。"""
+    """章ページの再生成系ジョブ一覧フラグメント。"""
     return "".join(
-        f"<div>#{j['id']} 再生成 ― {status_html(j['status'])} {esc(j['error'])}</div>" + usage_html(j)
+        f"<div>#{j['id']} {CHAPTER_JOB_LABELS.get(j['kind'], j['kind'])} ― "
+        f"{status_html(j['status'])} {esc(j['error'])}</div>" + usage_html(j)
         for j in jobs)
 
 
@@ -667,7 +673,9 @@ def work_detail(work_id: int):
         <form method='post' action='/chapters/{ch['id']}'>
         <div class='row'>タイトル<input type='text' name='title' value="{esc(ch['title'])}"></div>
         <div class='row'>概要<textarea name='outline' rows='4'>{esc(ch['outline'])}</textarea></div>
-        <button>概要を保存（承認）</button></form>{plan_block}
+        <button>概要を保存（承認）</button></form>
+        <form method='post' action='/chapters/{ch['id']}/outline_regen' style='margin-top:.5em'>
+        <button>この章の概要だけ再生成</button></form>{plan_block}
         <div class='row'><a href='/chapters/{ch['id']}'>章ページを開く（本文・Think・状態・修正要綱で再生成）</a></div>
         <form method='post' action='/chapters/{ch['id']}/delete' onsubmit="return confirm('この章を削除しますか？（本文・概要も消えます）')" style='margin-top:.5em'>
         <button style='background:#b03a3a;border-color:#b03a3a'>この章を削除</button></form></div>"""
@@ -941,22 +949,32 @@ def chapter_page(chapter_id: int):
     chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (w["id"],))
     final = pipeline.latest_artifact(w["id"], ch["id"], "final")
     draft = pipeline.latest_artifact(w["id"], ch["id"], "draft")
-    body_art = final or draft
-    body_label = "本文（2次修正済み）" if final else "本文（1次出力）"
     think = pipeline.latest_artifact(w["id"], ch["id"], "think")
     loop_log = pipeline.latest_artifact(w["id"], ch["id"], "log")
     design = pipeline.latest_artifact(w["id"], ch["id"], "prompt")
     in_state = pipeline.current_state(w, ch["number"])
     out_state = pipeline.chapter_end_state(w, ch)
-    chars = pipeline.chapter_chars(w["id"], ch["id"])
     min_chars = int(w.get("min_chars") or 0)
-    jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind='regen_chapter' ORDER BY id DESC LIMIT 3",
-                (w["id"],))
+    jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind IN (?,?,?) "
+                "ORDER BY id DESC LIMIT 5",
+                (w["id"],) + CHAPTER_JOB_KINDS)
     active = any(j["status"] in ("queued", "running") for j in jobs)
     job_html = _chapter_jobs_html(jobs)
 
-    body_html = (f"<pre>{esc(pipeline.read_text(body_art['path']))}</pre>"
-                 if body_art else "<p>まだ生成されていません。</p>")
+    def _body_card(art, label, opened):
+        if not art:
+            return ""
+        text = pipeline.read_text(art["path"])
+        return (f"<details class='card'{' open' if opened else ''}>"
+                f"<summary>{label}（{len(text)}文字）</summary>"
+                f"<pre>{esc(text)}</pre></details>")
+
+    draft_html = _body_card(draft, "本文（1次出力）", opened=not final)
+    final_html = _body_card(final, "本文（2次修正）", opened=True)
+    if not draft and not final:
+        draft_html = "<div class='card'><h2>本文</h2><p>まだ生成されていません。</p></div>"
+    status_line = (f"<div class='card'><p>状態：<span id='ch-status-self'>{esc(ch['status'])}</span>"
+                   + (f" ／ 最低{min_chars}文字" if min_chars > 0 else "") + "</p></div>")
     think_html = (f"<details class='card'><summary>Think（思考過程）</summary>"
                   f"<pre>{esc(pipeline.read_text(think['path']))}</pre></details>") if think else ""
     live_html = _chapter_live_html(w, ch)
@@ -984,10 +1002,24 @@ def chapter_page(chapter_id: int):
     if in_state or out_state:
         state_html = "<details class='card'><summary>状態（状態チェーン）</summary>"
         if in_state:
-            state_html += f"<h3>入力状態（この章の開始時点）</h3><pre>{esc(in_state)}</pre>"
+            state_html += ("<details><summary>入力状態（この章の開始時点）</summary>"
+                           f"<pre>{esc(in_state)}</pre></details>")
         if out_state:
-            state_html += f"<h3>終了状態（この章の終了時点・次章へ渡す）</h3><pre>{esc(out_state)}</pre>"
+            state_html += ("<details><summary>終了状態（この章の終了時点・次章へ渡す）</summary>"
+                           f"<pre>{esc(out_state)}</pre></details>")
         state_html += "</details>"
+
+    rev_art = pipeline.latest_artifact(w["id"], ch["id"], "rev_outline")
+    rev_notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
+    rev_html = ""
+    if rev_art:
+        rev_html = f"""
+    <div class='card'><h2>修正概要（確認してから本文を再生成）</h2>
+    <p>使った修正要綱：{esc(rev_notes) if rev_notes else '（記録なし）'}</p>
+    <form method='post' action='/chapters/{ch['id']}/regen_from_rev'>
+    <div class='row'>修正概要（この内容で本文を再生成します。直接編集もできます）<textarea name='rev_outline' rows='10'>{esc(pipeline.read_text(rev_art['path']))}</textarea></div>
+    <button>ステップ2：この修正概要で本文を再生成</button></form>
+    <p>押すと修正概要を保存し、生成指示書も作り直してから本文を再生成します（別スレッド実行・Context Window の80%まで使用）。正規の章概要は変わりません。</p></div>"""
 
     body = f"""
     <p><a href='/works/{w['id']}'>← 作品ページ「{esc(w['title'])}」に戻る</a></p>
@@ -995,22 +1027,26 @@ def chapter_page(chapter_id: int):
     <form method='post' action='/chapters/{ch['id']}'>
     <div class='row'>タイトル<input type='text' name='title' value="{esc(ch['title'])}"></div>
     <div class='row'>概要<textarea name='outline' rows='5'>{esc(ch['outline'])}</textarea></div>
-    <button>概要を保存（承認）</button></form></div>
-    <div class='card'><h2>{body_label}</h2>
-    <p>文字数：{chars}文字{'（最低' + str(min_chars) + '文字）' if min_chars > 0 else ''} ／ 状態：<span id='ch-status-self'>{esc(ch['status'])}</span></p>
-    {body_html}</div>
+    <button>概要を保存（承認）</button></form>
+    <form method='post' action='/chapters/{ch['id']}/outline_regen'>
+    <button>この章の概要だけ再生成</button>
+    <span>概要が途中で切れてしまった場合などに、この章の概要だけを作り直して上書きします（本文は変わりません）。</span></form></div>
+    {status_line}
+    {draft_html}
+    {final_html}
     <div id='dyn-live'>{live_html}</div>
     {loop_log_html}
     {plan_html}
     {think_html}
     {design_html}
     {state_html}
-    <div class='card'><h2>修正要綱で再生成</h2>
-    <form method='post' action='/chapters/{ch['id']}/regen'>
+    <div class='card'><h2>修正要綱で再生成（2段階）</h2>
+    <form method='post' action='/chapters/{ch['id']}/revise_outline'>
     <div class='row'>修正要綱（直したい点・盛り込む要素・避ける要素など）<textarea name='notes' rows='5' placeholder='例：灯台守の口調を資料どおり敬語に寄せる。手紙の伏線をもう一度置く。戦闘描写は短く。'></textarea></div>
-    <button>修正要綱を含んでこの章を再生成</button></form>
-    <p>再生成すると本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
-    <div id='dyn-jobs'>{job_html}</div></div>"""
+    <button>ステップ1：修正要綱から修正概要を作成</button></form>
+    <p>まず修正要綱に沿って章概要を作り直した「修正概要」を作成します。内容を確認・編集してよければ、ステップ2で本文を再生成してください。本文の再生成で本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
+    <div id='dyn-jobs'>{job_html}</div></div>
+    {rev_html}"""
     live_on = active or bool(live_html) or ch["status"] in ("generating", "revising")
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
@@ -1045,8 +1081,9 @@ def chapter_live(chapter_id: int):
     if not ch:
         return JSONResponse({"stop": True})
     w = db.one("SELECT * FROM works WHERE id=?", (ch["work_id"],))
-    jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind='regen_chapter' ORDER BY id DESC LIMIT 3",
-                (w["id"],))
+    jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind IN (?,?,?) "
+                "ORDER BY id DESC LIMIT 5",
+                (w["id"],) + CHAPTER_JOB_KINDS)
     active = (any(j["status"] in ("queued", "running") for j in jobs)
               or ch["status"] in ("generating", "revising"))
     regions = {
@@ -1113,6 +1150,42 @@ def chapter_regen(chapter_id: int, notes: str = Form("")):
     if not ch:
         return RedirectResponse("/", status_code=303)
     enqueue(ch["work_id"], "regen_chapter", {"chapter_id": chapter_id, "notes": notes})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/revise_outline")
+def chapter_revise_outline(chapter_id: int, notes: str = Form("")):
+    """修正要綱フローのステップ1：修正概要の作成ジョブを積む。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    enqueue(ch["work_id"], "revise_outline", {"chapter_id": chapter_id, "notes": notes})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/regen_from_rev")
+def chapter_regen_from_rev(chapter_id: int, rev_outline: str = Form("")):
+    """修正要綱フローのステップ2：編集済みの修正概要を保存し、それで本文を再生成する。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    w = db.one("SELECT * FROM works WHERE id=?", (ch["work_id"],))
+    if rev_outline.strip():
+        pipeline.save_artifact(w, ch, "rev_outline",
+                               f"ch{ch['number']:03d}_rev_outline.txt", rev_outline)
+    notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
+    enqueue(ch["work_id"], "regen_chapter",
+            {"chapter_id": chapter_id, "notes": notes, "use_rev_outline": True})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/outline_regen")
+def chapter_outline_regen(chapter_id: int):
+    """その章の概要だけを作り直すジョブを積む。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    enqueue(ch["work_id"], "outline_chapter", {"chapter_id": chapter_id})
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 
@@ -1191,9 +1264,9 @@ def settings_form():
     <div class='row'>Context Window（2次修正用）<select name='ctx_window_revise' onchange='HRev()' oninput='HRev()'>{ctx_rev_opts}</select><span id='reviseAlloc' style='font-weight:bold'></span> 2次修正はモデルが変わる前提なので、大きめのモデルに合わせて最大にしておくのが既定です。モデル変更時の2次修正では、この値の<b>80%</b>を Max Tokens に自動設定します。モデルが変わらない場合（スレッドモード等）は、通常の Context Window の配分を流用します</div>
     {_num_row('Max Tokens：概要生成', 'max_tokens_outline', pipeline.max_tokens('max_tokens_outline', 'MAX_TOKENS_OUTLINE', 16384))}
     {_num_row('Max Tokens：生成指示書・文書解析', 'max_tokens_design', pipeline.max_tokens('max_tokens_design', 'MAX_TOKENS_DESIGN', 8192))}
-    {_num_row('Max Tokens：本文生成（1次出力）', 'max_tokens_chapter', pipeline.max_tokens('max_tokens_chapter', 'MAX_TOKENS_CHAPTER', 32768), '思考トークンも内数です')}
+    {_num_row('Max Tokens：本文生成（1次出力）', 'max_tokens_chapter', pipeline.max_tokens('max_tokens_chapter', 'MAX_TOKENS_CHAPTER', 32768), '本文生成は別スレッド実行のため、実行時は Context Window の80%を自動使用します（この値は自動配分の初期値です）。思考トークンも内数です')}
     {_num_row('Max Tokens：要約', 'max_tokens_summary', pipeline.max_tokens('max_tokens_summary', 'MAX_TOKENS_SUMMARY', 4096))}
-    {_num_row('Max Tokens：2次修正', 'max_tokens_revise', pipeline.max_tokens('max_tokens_revise', 'MAX_TOKENS_REVISE', 65536), '大きめのモデルに切り替える前提で、既定は余裕を持たせています。モデルの Context Window の範囲で調整してください')}
+    {_num_row('Max Tokens：2次修正', 'max_tokens_revise', pipeline.max_tokens('max_tokens_revise', 'MAX_TOKENS_REVISE', 65536), '2次修正も別スレッド実行のため、実行時は対象ウィンドウ（モデル切替時は2次用 Context Window）の80%を自動使用します（この値は表示用です）')}
     {_num_row('Temperature', 'temperature', pipeline.temperature())}
     {_num_row('思考予算 reasoning_budget_tokens（0＝サーバー任せ）', 'reasoning_budget_tokens', llm.reasoning_budget(), 'thinking の上限の目安です。ジョブ表示のメーター（budget）にも使います')}
     <div class='row'><label><input type='checkbox' name='web_search_enabled' value='1' {'checked' if db.get_setting('web_search_enabled', '1') != '0' else ''}> Web検索を有効にする（用語・キャラクター検索。外部へ送るのは検索語のみ）</label></div>
@@ -1212,7 +1285,7 @@ def settings_form():
         function v(pct, lo) {{ var n = Math.floor(ctx * pct / 256) * 256; return Math.max(lo, n); }}
         return {{
           max_tokens_outline: v(0.10, 1024), max_tokens_design: v(0.05, 1024),
-          max_tokens_chapter: v(0.45, 4096), max_tokens_summary: v(0.05, 512),
+          max_tokens_chapter: v(0.80, 4096), max_tokens_summary: v(0.05, 512),
           max_tokens_revise: v(0.25, 4096)
         }};
       }}

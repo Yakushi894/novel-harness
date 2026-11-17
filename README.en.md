@@ -17,7 +17,7 @@ Workspaces are **per story**: one workspace per story/document; a new story gets
 1. **Load source**: Enter the concept and settings, or upload an existing text file (e.g. .txt) as source material for a continuation. Uploaded documents can be run through **initial document analysis**: the model extracts a foundation brief (premise, characters, plot so far, style and viewpoint, open threads) that is then included in every later generation step.
 2. **Next-chapter content**: Generate all chapter outlines in one pass, then edit and approve them in the Web UI. An "expand chapters" step then chains per chapter: detailed outline, start state, end-state target, detailed content, end state, and next chapter's start state (plus an ending state for the final chapter); after body generation the plan's states sync to the actual text. Extra instructions regenerate that chapter onward, and once approved, the following chapters can be regenerated too.
 3. **First pass (draft)**: Before writing each chapter, a *prompt-design layer* produces a chapter-specific instruction sheet (style/viewpoint consistency, elements to include or avoid), and the chapter is written from it. Each finished chapter is summarized for the next chapter's context (summary chaining).
-4. **Second pass (revision)**: Once all chapters exist, the container posts "please switch the model" to Synology Chat. When the model on the inference server changes, the container detects it via `/v1/models` and starts the revision automatically. **The wait has no timeout** — if the notification is missed overnight, drafts stay put and work resumes at the switch (with re-notifications).
+4. **Second pass (revision)**: Once all chapters exist, the container posts "please switch the model" to Synology Chat. When the model on the inference server changes, the container detects it via `/v1/models` and starts the revision automatically. **The wait has no timeout** — if the notification is missed overnight, drafts stay put and work resumes at the switch.
    - The second pass is a **proofreading** pass: it must not change the meaning, content, or plot. It only fixes particles and grammar, typos, unnatural Japanese, and stray Chinese/English (converted to Japanese) — except a foreign character's own lines.
    - **Thread mode (no switching)** is also available per work: with the model chosen at the start, each chapter runs in its own thread (independent context) from draft to finishing revision. Each thread receives the uploaded TXT and the chapter outlines, but not other chapters' body text, which keeps the context short.
    - **Single-chapter mode**: for one-chapter works; an "instructions (TXT attachable) → output" form on the work page (one submit runs outline through generation).
@@ -25,11 +25,11 @@ Workspaces are **per story**: one workspace per story/document; a new story gets
 
 ### The model follows the remote API
 
-The harness does not pin model names. Every request uses whatever model the inference server is currently serving. The second pass starts when the loaded model *changes* from the one used for the first pass (an optional hint substring can be configured instead).
+Model names are not pinned: every request uses whatever model the server is currently serving. The second pass starts when the loaded model *changes* from the one used for the first pass (an optional hint substring can be configured instead).
 
 ### GUI (AnythingLLM-style layout)
 
-A left sidebar always lists the workspaces and the chapters of the open workspace; the main area runs the pipeline. Chapters can also be deleted from the sidebar (✕). While a job runs, the work page updates asynchronously and shows elapsed time and token usage. Jobs interrupted by a container restart are recovered as failed. A per-work minimum chapter length (5,000–50,000 characters) can be set; drafts are continued until they reach it, otherwise the job errors. The Context Window can be set to 64k / 128k / 256k / 512k.
+A left sidebar always lists the workspaces and the chapters of the open workspace; the main area runs the pipeline. Chapters can also be deleted from the sidebar (✕). While a job runs, the work page updates asynchronously and shows elapsed time and token usage. A per-work minimum chapter length (5,000–50,000 characters) can be set; drafts are continued until they reach it, otherwise the job errors. The Context Window can be set to 64k / 128k / 256k / 512k. Body generation and the revision run as separate-thread calls and use 80% of the Context Window as their output cap at runtime.
 
 ### Loop detection
 
@@ -37,15 +37,15 @@ If the body or Think output starts repeating while generating, reception stops i
 
 ### Live streaming view and sidebar status
 
-Generation runs in the container's worker, so inference and loop detection continue even if you close the browser. While a chapter generates, its page streams the body and Think in progress (Think is collapsible). The sidebar shows context fill, GPU prefill/decode speeds (servers reporting timings), and the generating chapter with its counts. Pages update asynchronously without a full reload, so reading the next chapter's outline during generation is never interrupted. The initial document analysis result and the state chain are now collapsible sections.
+Generation runs in the container's worker, so inference and loop detection continue even if you close the browser. While a chapter generates, its page streams the body and Think in progress (Think is collapsible). The sidebar shows context fill, GPU prefill/decode speeds (servers reporting timings), and the generating chapter with its counts. Pages update asynchronously without a full reload, so reading the next chapter's outline during generation is never interrupted. The initial analysis, the state chain (input/output states individually) and the body are collapsible, and the draft and the revision are shown in separate frames.
 
-Each chapter also has its own **chapter page** (outline → generated text → **Think** (the model's reasoning) → state → revision notes). Writing **revision notes** there regenerates just that chapter with the notes included. A **state chain** keeps the story state explicit (see the flow above): each chapter takes its start state as input and outputs its end state for the next.
+Each chapter also has its own **chapter page** (outline → generated text → **Think** (the model's reasoning) → state → revision notes). An outline can be regenerated per chapter. Regeneration from **revision notes** is two-step: a revised outline is drafted from the notes first (review/edit it), then the body is regenerated from it with a rebuilt instruction sheet and a large token budget in a separate thread. A **state chain** keeps the story state explicit: each chapter takes its start state as input and outputs its end state for the next.
 
 ### Web search and derivative-work mode
 
 - **Term lookup**: enter a word and the harness checks Japanese Wiktionary / Wikipedia / the web, saves a "term memo", and includes it in later generation.
 - **Term check (automatic)**: before outline and draft generation, the model itself flags words it doesn't know; terms missing from the glossary DB are looked up and added.
-- **Glossary DB**: learned meanings are stored in a separate dictionary. **They survive workspace deletion** and are reused by other stories (sidebar's Glossary DB page).
+- **Glossary DB**: learned meanings are stored in a separate dictionary. **They survive workspace deletion** and are reused by other stories.
 - **Derivative-work (fanfiction) mode**: a per-work ON/OFF toggle (can be hidden in Settings; shown by default). When ON, the AI is told the work is derivative. When OFF, it judges from the text alone.
 - **Character profile search** (when derivative mode is ON): gathers public material for a character and summarizes a profile (pronouns, speech endings, catchphrases, mannerisms) for use in generation.
 
@@ -57,7 +57,7 @@ Editable in the Web UI, applied immediately (no restart):
 
 - Inference server URL and API key (leave the key empty if your LAN setup doesn't need one)
 - **Model Context Window** (live re-allocation of every Max Tokens, with a red over-limit warning)
-- **Context Window (for the second pass)**: a separate budget for the revision pass on a different model (default 512k; a changed model gets 80% of it as Max Tokens). Same model: the regular allocation applies
+- **Context Window (for the second pass)**: a separate budget for the revision pass on a different model (default 512k). The revision always uses 80% of the applicable window as Max Tokens (same model: 80% of the regular window)
 - **Max Tokens** per stage (outline / instruction sheet / chapter body / summary / revision)
 - Temperature, revision-model hint, Synology Chat webhook URL
 
@@ -134,6 +134,6 @@ The output page is a formatted reading page (serif type, table of contents, hori
 ## Notes
 
 - Strata-family servers have **no model-switching API** (only `POST /load` / `POST /unload`). The revision pass is therefore "notify + manual switch + automatic detection" by design.
-- Thinking tokens count toward the output cap. Caps live in Settings (Max Tokens) and are re-allocated automatically when the Context Window changes.
+- Thinking tokens count toward the output cap (see the token policy in the GUI section).
 - The UI is for LAN / Tailscale access only. Do not expose it to the internet.
 - Review by Muse is an opt-in lane: only works you explicitly mark as "Muse review OK" are ever sent; everything else never leaves the local network.

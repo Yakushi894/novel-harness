@@ -341,17 +341,28 @@ def _chat_once(payload, timeout_s):
 
 
 def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0,
-         progress=None):
+         progress=None, window=None):
     """1回のチャット補完を行い、本文テキストを返す。model=None/'auto' ならロード中モデルを使う。
 
     本文または thinking が繰り返しループに入った場合は LoopDetectedError で
     異常終了する（生成中のストリーミング検査＋受信後の検査）。
     progress があれば、生成中に (本文の途中経過, thinking の途中経過) を逐次通知する
     （逐次表示・ライブ状態の保存用。呼び出し側で間引くこと）。
+    各呼び出しは独立した文脈（別スレッド）で実行されるため、出力上限は対象
+    ウィンドウ（window 指定時はその値、なければ設定の Context Window）の
+    80%で頭打ちにする。
     """
     global LAST_THINKING
     if model in (None, "", "auto"):
         model = current_model()
+    _win = window or 0
+    if not _win:
+        try:
+            _win = int(_setting("ctx_window") or 0)
+        except ValueError:
+            _win = 0
+    if _win > 0:
+        max_tokens = min(max_tokens, int(_win * 0.8))
     if MOCK:
         text = _mock_response(system, user)
         LAST_THINKING = "（モック思考）この章では手紙の差出人への伏線を置き、灯台守の口調を資料どおりに保つ。視点は三人称のまま、場面は港の夕景から始める。"

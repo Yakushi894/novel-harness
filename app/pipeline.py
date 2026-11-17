@@ -37,8 +37,10 @@ def ctx_window_revise():
 def allocate_tokens(ctx):
     """Context Window から各工程の Max Tokens を自動再配置する配分（初期値）。
 
-    合計で Context Window の約90%を使うカツカツ仕様：
-    概要10%／指示書・解析5%／本文45%／要約5%／2次修正25%。
+    各工程は独立した呼び出し（別スレッド）で実行され、文脈を持ち越さないため、
+    合計で配り合う必要はない。本文は別スレッドの80%まで使う贅沢仕様：
+    概要10%／指示書・解析5%／本文80%／要約5%／2次修正25%（表示用の初期値。
+    2次修正の実行時は常に対象ウィンドウの80%を使う）。
     256 単位に丸め、工程ごとの下限を保証する。
     """
     def _v(pct, lo):
@@ -46,21 +48,32 @@ def allocate_tokens(ctx):
     return {
         "max_tokens_outline": _v(0.10, 1024),
         "max_tokens_design": _v(0.05, 1024),
-        "max_tokens_chapter": _v(0.45, 4096),
+        "max_tokens_chapter": _v(0.80, 4096),
         "max_tokens_summary": _v(0.05, 512),
         "max_tokens_revise": _v(0.25, 4096),
     }
 
 
+def body_max_tokens():
+    """本文生成（1次出力・再生成）の Max Tokens。
+
+    本文生成は独立した呼び出し（別スレッド）で実行され、前の生成の文脈を
+    引き継がないため、1次出力の設定値で頭打ちにせず、Context Window の
+    80%を出力上限としてたっぷり使う。
+    """
+    return max(4096, (int(ctx_window() * 0.8) // 256) * 256)
+
+
 def revise_max_tokens(model_changed):
     """2次修正の Max Tokens。
 
-    モデルが変わった場合は、2次用 Context Window の80%を使う贅沢仕様で自動設定する。
-    モデルが変わらない場合は通常配分の max_tokens_revise を使う。
+    2次修正も独立した呼び出し（別スレッド）で実行されるため、1次出力の
+    トークン数から差し引くような配分はせず、常に対象ウィンドウの80%を使う。
+    モデルが変わった場合は2次用 Context Window、変わらない場合は通常の
+    Context Window が対象になる。
     """
-    if model_changed:
-        return max(4096, (int(ctx_window_revise() * 0.8) // 256) * 256)
-    return max_tokens("max_tokens_revise", "MAX_TOKENS_REVISE", 65536)
+    ctx = ctx_window_revise() if model_changed else ctx_window()
+    return max(4096, (int(ctx * 0.8) // 256) * 256)
 
 
 def max_tokens(key, env_key, default):
@@ -176,7 +189,7 @@ def save_artifact(work, chapter, kind, filename, text):
     sub = {"source": "source", "analysis": "source", "glossary": "source", "character": "source",
            "prompt": "prompts", "draft": "drafts", "state": "states", "think": "thinking",
            "summary": "summaries", "revised": "revised", "final": "final", "log": "logs",
-           "plan": "plans"}[kind]
+           "plan": "plans", "rev_outline": "plans"}[kind]
     path = os.path.join(d, sub, filename)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -442,7 +455,7 @@ def ensure_min_chars(job, work, ch, body, progress=None):
                 tail=body[-2500:],
                 current=len(body), target=target,
                 need=need, round_min=min(need, 3000)),
-            max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
+            max_tokens=body_max_tokens(),
             temperature=temperature(),
             progress=(lambda c, t, _b=base_snapshot: progress(_b + (c or ""), t))
             if progress else None)
@@ -749,7 +762,7 @@ def do_generate_chapters(job, work):
                     prev_tail=prev_tail(work, ch["number"]),
                     number=ch["number"], title=ch["title"], outline=ch["outline"],
                     min_chars_note=min_chars_note(work)),
-                max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
+                max_tokens=body_max_tokens(),
                 temperature=temperature(), progress=pw)
             save_think(work, ch)
             body = ensure_min_chars(job, work, ch, body, progress=pw)
@@ -803,7 +816,8 @@ def revise_chapters(job, work, chapters, model_changed=False):
                     settings=settings_text(work, ctx=eff_ctx), outlines=outlines_text(work),
                     number=ch["number"], title=ch["title"], text=body),
                 max_tokens=revise_max_tokens(model_changed),
-                temperature=temperature(), progress=pw)
+                temperature=temperature(), progress=pw,
+                window=eff_ctx if model_changed else ctx_window())
             clear_partial(work, ch)
         except llm.LoopDetectedError as e:
             save_loop_log(work, ch, "2次修正", e)
@@ -862,7 +876,7 @@ def do_generate_thread(job, work):
                         prev_tail="",
                         number=ch["number"], title=ch["title"], outline=ch["outline"],
                         min_chars_note=min_chars_note(work)),
-                    max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
+                    max_tokens=body_max_tokens(),
                     temperature=temperature(), progress=pw)
                 save_think(work, ch)
                 body = ensure_min_chars(job, work, ch, body, progress=pw)
@@ -1092,11 +1106,30 @@ def do_regen_chapter(job, work):
     notes = (payload.get("notes") or "").strip()
     prev_status = ch["status"]
     set_chapter_status(ch["id"], "generating")
-    design = latest_artifact(work["id"], ch["id"], "prompt")
-    base_instruction = read_text(design["path"]) if design else ""
-    instruction = base_instruction + plan_instruction(work, ch)
-    if notes:
-        instruction = (instruction + f"\n\n【修正要綱】\n{notes}").strip()
+    rev_outline = ""
+    if payload.get("use_rev_outline"):
+        rev_art = latest_artifact(work["id"], ch["id"], "rev_outline")
+        if rev_art:
+            rev_outline = read_text(rev_art["path"]).strip()
+    if rev_outline:
+        # 修正概要フロー：生成指示書も修正概要に合わせて作り直し（別スレッド実行）、
+        # 本文は修正概要に従って生成する。正規の章概要（chapters.outline）は変えない。
+        intent = (work["request"] or "")
+        if notes:
+            intent = (intent + f"\n\n【修正要綱】\n{notes}").strip()
+        base_instruction = design_prompt(work, ch, intent)
+        instruction = (base_instruction + plan_instruction(work, ch)
+                       + "\n\n【重要】この章は下記の「修正概要」に従って書いてください。"
+                         "全章概要にある同章の記述より修正概要を優先します。"
+                       + f"\n\n【修正概要】\n{rev_outline}")
+        if notes:
+            instruction = (instruction + f"\n\n【修正要綱】\n{notes}").strip()
+    else:
+        design = latest_artifact(work["id"], ch["id"], "prompt")
+        base_instruction = read_text(design["path"]) if design else ""
+        instruction = base_instruction + plan_instruction(work, ch)
+        if notes:
+            instruction = (instruction + f"\n\n【修正要綱】\n{notes}").strip()
     prev_state = current_state(work, ch["number"])
     pw = progress_writer(work, ch, "再生成")
     try:
@@ -1108,9 +1141,10 @@ def do_regen_chapter(job, work):
                 outlines=outlines_text(work),
                 summaries=summaries_text(work, ch["number"]),
                 prev_tail=prev_tail(work, ch["number"]) if work_mode(work) != "thread" else "",
-                number=ch["number"], title=ch["title"], outline=ch["outline"],
+                number=ch["number"], title=ch["title"],
+                outline=rev_outline or ch["outline"],
                 min_chars_note=min_chars_note(work)),
-            max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
+            max_tokens=body_max_tokens(),
             temperature=temperature(), progress=pw)
         save_think(work, ch)
         body = ensure_min_chars(job, work, ch, body, progress=pw)
@@ -1147,11 +1181,92 @@ def do_regen_chapter(job, work):
     notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章を修正要綱つきで再生成しました。")
 
 
+def do_revise_outline(job, work):
+    """修正要綱フロー第1段：修正要綱に沿って、その章の「修正概要」を作り直す。
+
+    正規の章概要（chapters.outline）は上書きせず、成果物 kind='rev_outline' に
+    保存する。章ページで内容を確認・編集し、OKなら第2段（本文の再生成）へ進む。
+    使った修正要綱は設定 rev_outline_notes:<章ID> に残し、画面に併記する。
+    """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    ch = db.one("SELECT * FROM chapters WHERE id=? AND work_id=?",
+                (payload.get("chapter_id"), work["id"]))
+    if not ch:
+        raise RuntimeError("修正概要を作る章が見つかりません。")
+    notes = (payload.get("notes") or "").strip()
+    if not notes:
+        raise RuntimeError("修正要綱が空です。直したい点を入力してください。")
+    plan_secs = get_plan(work, ch)
+    plan_text = plan_to_text(plan_secs) if plan_secs else "（なし）"
+    try:
+        text = llm.chat(
+            "auto", prompts.REV_OUTLINE_SYSTEM + sys_note(work),
+            prompts.REV_OUTLINE_USER.format(
+                request=work["request"], settings=settings_text(work),
+                outlines=outlines_text(work),
+                state=current_state(work, ch["number"]),
+                number=ch["number"], title=ch["title"], outline=ch["outline"],
+                plan=plan_text, notes=notes),
+            max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
+            temperature=temperature())
+    except llm.LoopDetectedError as e:
+        save_loop_log(work, ch, "修正概要の作成", e)
+        raise
+    if not text.strip():
+        raise RuntimeError("修正概要の生成結果が空でした。もう一度お試しください。")
+    save_artifact(work, ch, "rev_outline", f"ch{ch['number']:03d}_rev_outline.txt", text)
+    db.set_setting(f"rev_outline_notes:{ch['id']}", notes)
+    notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章の修正概要ができました。"
+           "章ページで確認し、よければ本文を再生成してください。")
+
+
+def do_outline_chapter(job, work):
+    """章ごとの概要再生成：指定した1章の概要だけを作り直して chapters を更新する。
+
+    全体生成の概要が途中で切れて1章だけ壊れた場合などの救済用。前後の章との
+    つながりは現状の全章概要を渡して合わせる。パースできない場合は生出力を
+    章のログ成果物に残してエラーにする（全体概要生成と同じ方針）。
+    """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    ch = db.one("SELECT * FROM chapters WHERE id=? AND work_id=?",
+                (payload.get("chapter_id"), work["id"]))
+    if not ch:
+        raise RuntimeError("概要を再生成する章が見つかりません。")
+    user = prompts.OUTLINE_ONE_USER.format(
+        request=work["request"], settings=settings_text(work),
+        outlines=outlines_text(work), number=ch["number"])
+    text = llm.chat(
+        "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
+        max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
+        temperature=temperature())
+    found = parse_outline_text(text)
+    picked = None
+    for num, title, body in found:
+        if int(num) == int(ch["number"]):
+            picked = (title, body)
+            break
+    if picked is None and found:
+        picked = (found[0][1], found[0][2])
+    if picked is None:
+        save_artifact(work, ch, "log", f"ch{ch['number']:03d}_outline_failed.txt", text)
+        raise RuntimeError("概要のパースに失敗しました（モデルの生出力を章の成果物ログに保存しました）")
+    db.run("UPDATE chapters SET title=?, outline=? WHERE id=?",
+           (picked[0].strip(), picked[1].strip(), ch["id"]))
+    notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章の概要を再生成しました。")
+
+
 HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "generate_chapters": do_generate_chapters, "revise_all": do_revise_all,
             "search_term": do_search_term, "term_check": do_term_check,
             "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
-            "expand_plans": do_expand_plans, "regen_plan": do_regen_plan}
+            "expand_plans": do_expand_plans, "regen_plan": do_regen_plan,
+            "revise_outline": do_revise_outline, "outline_chapter": do_outline_chapter}
 
 
 def _cancelled(job):
