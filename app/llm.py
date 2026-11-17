@@ -52,6 +52,22 @@ USAGE_SINK = None
 # JobCancelledError で中断する（従来は工程の合間でしか取消が効かなかった）。
 CANCEL_CHECK = None
 
+# 現在の処理フェーズの通知先（pipeline が設定する）。chat(phase=...) で渡された
+# 「第N章 本文を生成中」等のラベルと状態（prefill=読み込み中／gen=生成中／
+# wait=一括受信の応答待ち）を、対象ワークスペース ID とともに通知する。
+# ハーネスの画面（サイドバー・現在の作業パネル）が「いま何をしているか」を出すため。
+PHASE_SINK = None
+_PHASE = None
+_PHASE_WID = None
+
+
+def _phase_report(state):
+    if PHASE_SINK and _PHASE and _PHASE_WID:
+        try:
+            PHASE_SINK(_PHASE_WID, _PHASE, state)
+        except Exception:
+            pass
+
 
 class JobCancelledError(RuntimeError):
     """ユーザーの停止（ジョブ取消）により生成を中断した。"""
@@ -316,6 +332,7 @@ def _chat_streaming(payload, model, max_tokens, timeout_s, progress=None):
     body["stream_options"] = {"include_usage": True}
     content_parts, think_parts = [], []
     content_len = think_len = 0
+    phase_gen = False
     checked_content = checked_think = 0
     cancel_mark = 0
     cancel_clock = time.time()
@@ -361,6 +378,10 @@ def _chat_streaming(payload, model, max_tokens, timeout_s, progress=None):
                     if t:
                         think_parts.append(t)
                         think_len += len(t)
+                    if (c or t) and not phase_gen:
+                        # 最初のチャンクが届いた＝読み込み（プリフィル）完了、生成開始。
+                        phase_gen = True
+                        _phase_report("gen")
                     if content_len - checked_content >= 200 or think_len - checked_think >= 200:
                         checked_content, checked_think = content_len, think_len
                         _check_loops("".join(content_parts), "".join(think_parts))
@@ -429,7 +450,7 @@ def _chat_once(payload, timeout_s):
 
 
 def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0,
-         progress=None, window=None, body=False):
+         progress=None, window=None, body=False, phase=None):
     """1回のチャット補完を行い、本文テキストを返す。model=None/'auto' ならロード中モデルを使う。
 
     本文または thinking が繰り返しループに入った場合は LoopDetectedError で
@@ -441,9 +462,14 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
     90%で頭打ちにする（本文生成・2次修正は呼び出し側で80%に決めている）。
     body=True は本文系の呼び出し（本文生成・続き・2次修正）の印で、設定
     loop_body_only=1 のときループ検出をこの呼び出しに限るために使う。
+    phase は「第N章 本文を生成中」等の表示用ラベルで、PHASE_SINK 経由で
+    画面に現在の処理として表示される（読み込み中→生成中の遷移も通知する）。
     """
-    global LAST_THINKING, _BODY_CALL
+    global LAST_THINKING, _BODY_CALL, _PHASE
     _BODY_CALL = body
+    _PHASE = phase
+    if phase:
+        _phase_report("prefill")
     if model in (None, "", "auto"):
         model = current_model()
     _win = window or 0
@@ -485,6 +511,7 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
     try:
         j = _chat_streaming(payload, model, max_tokens, timeout_s, progress=progress)
     except _StreamUnsupported:
+        _phase_report("wait")
         j = _chat_once(payload, timeout_s)
     _report_usage(j, max_tokens, req_chars=len(system or "") + len(user or ""))
     content, think = _split_thinking(j["choices"][0]["message"])

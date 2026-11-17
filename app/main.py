@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.36"
+APP_VERSION = "1.37"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -114,6 +114,25 @@ def _fmt_tps(v):
     return f"{f:,.0f}" if f >= 100 else f"{f:.1f}"
 
 
+PHASE_STATE_LABEL = {"prefill": "読み込み中", "gen": "生成中", "wait": "応答待ち"}
+
+
+def _phase_text(work_id) -> str:
+    """その作品の現在の処理フェーズ表示（例：第3章 本文を生成中・読み込み中（25秒））。"""
+    label = db.get_setting(f"live:phase:{work_id}", "")
+    if not label:
+        return ""
+    state = PHASE_STATE_LABEL.get(db.get_setting(f"live:phase_state:{work_id}", ""), "")
+    elapsed = ""
+    at = db.get_setting(f"live:phase_at:{work_id}", "")
+    if at:
+        try:
+            elapsed = f"（{fmt_dur(int(time.time()) - int(float(at)))}）"
+        except ValueError:
+            pass
+    return f"処理：{label}" + (f"・{state}" if state else "") + elapsed
+
+
 def _sidebar_status() -> str:
     """サイドバー下部：直近の呼び出しのコンテキスト Fill と処理速度、生成中の逐次状態。"""
     try:
@@ -123,8 +142,13 @@ def _sidebar_status() -> str:
         fill = min(100, round((pt + ct) / ctx * 100)) if ctx and (pt + ct) else 0
         pre = db.get_setting("live:prefill_tps", "")
         dec = db.get_setting("live:decode_tps", "")
-        html = (
-            "<div style='margin-top:.6em'>"
+        html = "<div style='margin-top:.6em'>"
+        run = db.one("SELECT work_id FROM jobs WHERE status='running' ORDER BY id LIMIT 1")
+        if run:
+            ph = _phase_text(run["work_id"])
+            if ph:
+                html += f"<div style='color:#7fd4a8;font-weight:600;margin-bottom:.3em'>{esc(ph)}</div>"
+        html += (
             f"<div>コンテキスト Fill：{fill}%（{(pt + ct):,} / {ctx:,} tok）</div>"
             f"<div style='background:#333;height:6px;border-radius:3px;margin:.2em 0'>"
             f"<div style='background:#e8862e;height:6px;border-radius:3px;width:{fill}%'></div></div>"
@@ -604,6 +628,9 @@ def _current_work_html(w) -> str:
             head = (f"<p><b style='color:#b97d1a'>● 作業中</b>：{esc(label)}"
                     f"{('（' + ch_note + ('・' + esc(live_label) if live_label else '') + '）') if ch_note else ''}"
                     f" ― 開始から {dur}</p>")
+            ph = _phase_text(w["id"])
+            if ph:
+                head += f"<p style='color:#2e7d32'><b>いま：{esc(ph)}</b></p>"
         return head + peek_html(j, ch)
     if j["status"] == "done":
         return f"<p>待機中です。直近の工程「{esc(label)}」は完了しています。</p>"

@@ -382,7 +382,7 @@ def update_state(work, ch, body, prev_state):
             prev_state=prev_state or "（物語の開始前。状態はまだありません）",
             number=ch["number"], title=ch["title"], text=body),
         max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-        temperature=temperature())
+        temperature=temperature(), phase=f"第{ch['number']}章 状態（状態チェーン）を更新中")
     save_artifact(work, ch, "state", f"ch{ch['number']:03d}_state.txt", new_state)
     _sync_plan_from_body(work, ch, new_state)
     return new_state
@@ -521,7 +521,7 @@ def ensure_min_chars(job, work, ch, body, progress=None):
             max_tokens=body_max_tokens(),
             temperature=temperature(),
             progress=(lambda c, t, _b=base_snapshot: progress(_b + (c or ""), t))
-            if progress else None, body=True)
+            if progress else None, body=True, phase=f"第{ch['number']}章 本文を書き足し中")
         extra = (extra or "").strip()
         if extra:
             body = body.rstrip() + "\n" + extra
@@ -556,13 +556,13 @@ def do_analyze(job, work):
         "auto", prompts.ANALYSIS_SYSTEM + sys_note(work),
         prompts.ANALYSIS_USER.format(text=text),
         max_tokens=design_max_tokens(),
-        temperature=temperature())
+        temperature=temperature(), phase="文書を解析中")
     save_artifact(work, None, "analysis", "analysis.txt", result)
     state = llm.chat(
         "auto", prompts.STATE_EXTRACT_SYSTEM + sys_note(work),
         prompts.STATE_EXTRACT_USER.format(analysis=result, text=text),
         max_tokens=design_max_tokens(),
-        temperature=temperature())
+        temperature=temperature(), phase="初期状態（状態チェーン）を抽出中")
     save_artifact(work, None, "state", "state_initial.txt", state)
     set_stage(work["id"], "analyzed")
     notify(f"【小説ハーネス】「{work['title']}」の初期文書解析が完了しました。解析結果と現在の状態が以降の生成に反映されます。")
@@ -619,7 +619,7 @@ def do_outline(job, work):
     text = llm.chat(
         "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-        temperature=temperature())
+        temperature=temperature(), phase="章概要を作成中")
     found = parse_outline_text(text)
     if not found:
         # モデルが短く打ち切る・形式を崩すことがある。生出力を残し、形式を
@@ -631,7 +631,7 @@ def do_outline(job, work):
         text = llm.chat(
             "auto", prompts.OUTLINE_SYSTEM + sys_note(work), retry_user,
             max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-            temperature=temperature())
+            temperature=temperature(), phase="章概要を作成中（再試行）")
         found = parse_outline_text(text)
         if not found:
             save_artifact(work, None, "log", "outline_failed.txt", text)
@@ -737,7 +737,7 @@ def _expand_one_plan(work, ch, chapters):
             start_state=plan_start_state(work, ch, chapters),
             final_note=_final_note(work, ch, chapters), notes_block=""),
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-        temperature=temperature())
+        temperature=temperature(), phase=f"第{ch['number']}章 展開計画を作成中")
     sections = parse_plan(text)
     if not sections.get("章内容詳細") or not sections.get("章終了時の状態"):
         save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
@@ -843,7 +843,7 @@ def do_final_check(job, work):
             settings=settings_text(work),
             summaries=summaries_text(work, 10 ** 9) or "（要約なし）",
             state=state_text or "（状態シートなし）"),
-        max_tokens=design_max_tokens(), temperature=temperature())
+        max_tokens=design_max_tokens(), temperature=temperature(), phase="最終チェック中")
     lines.append("")
     lines.append("■ 設定・あらすじとの矛盾チェック（モデル）")
     lines.append(check_text)
@@ -891,7 +891,7 @@ def do_regen_plan(job, work):
             notes=notes or "（追加指定なし：内容詳細以降を練り直す）",
             final_note=_final_note(work, ch, chapters)),
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-        temperature=temperature())
+        temperature=temperature(), phase=f"第{ch['number']}章 展開計画を作り直し中")
     new = parse_plan(text)
     if not new.get("章内容詳細") or not new.get("章終了時の状態"):
         save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
@@ -920,7 +920,7 @@ def design_prompt(work, chapter, intent, use_tail=True):
             prev_tail=prev_tail(work, chapter["number"]) if use_tail else "",
             source="", intent=intent),
         max_tokens=design_max_tokens(),
-        temperature=temperature())
+        temperature=temperature(), phase="生成指示書を作成中")
     save_artifact(work, chapter, "prompt", f"ch{chapter['number']:03d}.txt", text)
     return text
 
@@ -955,7 +955,7 @@ def do_generate_chapters(job, work):
                     number=ch["number"], title=ch["title"], outline=ch["outline"],
                     min_chars_note=min_chars_note(work)),
                 max_tokens=body_max_tokens(),
-                temperature=temperature(), progress=pw, body=True)
+                temperature=temperature(), progress=pw, body=True, phase=f"第{ch['number']}章 本文を生成中")
             save_think(work, ch)
             body = ensure_min_chars(job, work, ch, body, progress=pw)
             save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
@@ -966,7 +966,7 @@ def do_generate_chapters(job, work):
                 "auto", prompts.SUMMARY_SYSTEM,
                 prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
                 max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-                temperature=temperature())
+                temperature=temperature(), phase=f"第{ch['number']}章 要約を作成中")
             save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
             set_chapter_status(ch["id"], "generated")
         except llm.LoopDetectedError as e:
@@ -1009,7 +1009,7 @@ def revise_chapters(job, work, chapters, model_changed=False):
                     number=ch["number"], title=ch["title"], text=body),
                 max_tokens=revise_max_tokens(model_changed),
                 temperature=temperature(), progress=pw, body=True,
-                window=eff_ctx if model_changed else ctx_window())
+                window=eff_ctx if model_changed else ctx_window(), phase=f"第{ch['number']}章 2次修正中")
             clear_partial(work, ch)
         except llm.LoopDetectedError as e:
             save_loop_log(work, ch, "2次修正", e)
@@ -1069,7 +1069,7 @@ def do_generate_thread(job, work):
                         number=ch["number"], title=ch["title"], outline=ch["outline"],
                         min_chars_note=min_chars_note(work)),
                     max_tokens=body_max_tokens(),
-                    temperature=temperature(), progress=pw, body=True)
+                    temperature=temperature(), progress=pw, body=True, phase=f"第{ch['number']}章 本文を生成中")
                 save_think(work, ch)
                 body = ensure_min_chars(job, work, ch, body, progress=pw)
                 save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
@@ -1080,7 +1080,7 @@ def do_generate_thread(job, work):
                     "auto", prompts.SUMMARY_SYSTEM,
                     prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
                     max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-                    temperature=temperature())
+                    temperature=temperature(), phase=f"第{ch['number']}章 要約を作成中")
                 save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
                 set_chapter_status(ch["id"], "generated")
             except llm.LoopDetectedError as e:
@@ -1208,7 +1208,7 @@ def run_term_check(work):
     out = llm.chat(
         "auto", prompts.TERM_EXTRACT_SYSTEM,
         prompts.TERM_EXTRACT_USER.format(known="\n".join(known_all) or "（なし）", text=blob),
-        max_tokens=1024, temperature=0.2)
+        max_tokens=1024, temperature=0.2, phase="用語をチェック中")
     terms = []
     for line in out.splitlines():
         t = re.sub(r"^[・\-*\s　]+", "", line).strip().strip("「」")
@@ -1268,7 +1268,7 @@ def do_search_term(job, work):
             prompts.CHARACTER_PROFILE_USER.format(
                 label=f"{origin} {term}".strip(), material=material),
             max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
-            temperature=temperature())
+            temperature=temperature(), phase="用語の意味を検索中")
         fname = "character_" + re.sub(r"[^\w]+", "_", term)[:40] + ".txt"
         save_artifact(work, None, "character", fname, profile)
         notify(f"【小説ハーネス】「{work['title']}」のキャラクター概要（{term}）を作成しました。")
@@ -1337,7 +1337,7 @@ def do_regen_chapter(job, work):
                 outline=rev_outline or ch["outline"],
                 min_chars_note=min_chars_note(work)),
             max_tokens=body_max_tokens(),
-            temperature=temperature(), progress=pw, body=True)
+            temperature=temperature(), progress=pw, body=True, phase=f"第{ch['number']}章 本文を生成中")
         save_think(work, ch)
         body = ensure_min_chars(job, work, ch, body, progress=pw)
         save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
@@ -1362,7 +1362,7 @@ def do_regen_chapter(job, work):
                 "auto", prompts.SUMMARY_SYSTEM,
                 prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
                 max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-                temperature=temperature())
+                temperature=temperature(), phase=f"第{ch['number']}章 要約を作成中")
             save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
     except llm.LoopDetectedError as e:
         save_loop_log(work, ch, "章の再生成", e)
@@ -1410,7 +1410,7 @@ def do_revise_outline(job, work):
                 number=ch["number"], title=ch["title"], outline=ch["outline"],
                 plan=plan_text, notes=notes),
             max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-            temperature=temperature())
+            temperature=temperature(), phase="修正要綱を作成中")
     except llm.LoopDetectedError as e:
         save_loop_log(work, ch, "修正概要の作成", e)
         raise
@@ -1443,7 +1443,7 @@ def do_outline_chapter(job, work):
     text = llm.chat(
         "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-        temperature=temperature())
+        temperature=temperature(), phase=f"第{ch['number']}章 概要を作成中")
     found = parse_outline_text(text)
     picked = None
     for num, title, body in found:
@@ -1472,6 +1472,16 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
 def _cancelled(job):
     row = db.one("SELECT status FROM jobs WHERE id=?", (job["id"],))
     return not row or row["status"] == "cancelled"
+
+
+def _write_phase(wid, label, state):
+    """現在の処理フェーズを live 設定へ書く（画面表示用、llm.PHASE_SINK）。"""
+    db.set_setting(f"live:phase:{wid}", label)
+    db.set_setting(f"live:phase_state:{wid}", state)
+    db.set_setting(f"live:phase_at:{wid}", str(int(time.time())))
+
+
+llm.PHASE_SINK = _write_phase
 
 
 def _usage_sink_for(job_id):
@@ -1525,6 +1535,7 @@ def worker_loop():
             work = db.one("SELECT * FROM works WHERE id=?", (job["work_id"],))
             llm.USAGE_SINK = _usage_sink_for(job["id"])
             llm.CANCEL_CHECK = (lambda jid: lambda: _cancelled({"id": jid}))(job["id"])
+            llm._PHASE_WID = job["work_id"]
             try:
                 HANDLERS[job["kind"]](job, work)
                 if not _cancelled(job):
@@ -1553,6 +1564,11 @@ def worker_loop():
             finally:
                 llm.USAGE_SINK = None
                 llm.CANCEL_CHECK = None
+                llm._PHASE_WID = None
+                if work:
+                    for key in (f"live:phase:{work['id']}", f"live:phase_state:{work['id']}",
+                                f"live:phase_at:{work['id']}"):
+                        db.set_setting(key, "")
         except Exception:
             # ワーカースレッド自体は絶対に落とさない（ジョブが running のまま固まる事故を防ぐ）
             traceback.print_exc()
