@@ -99,6 +99,8 @@ def detect_loop(text):
     A) 同じ文（10字以上）が6回以上連続する
     B) 末尾が周期 p（8〜600字）の繰り返しで、800字以上の区間がその周期で一致する
        （繰り返し回数4回以上に相当する長さがある場合のみ）
+    C) 短いフレーズ（10字以上）が直近4000字以内に5回以上再出現する
+       （連続していなくてもよい。会話のたびに同じ台詞が戻るタイプのループ対策）
     """
     if not text or len(text) < 500:
         return None
@@ -112,6 +114,15 @@ def detect_loop(text):
         prev = u
         if run >= 6:
             return {"unit": u, "repeats": run, "chars": len(text)}
+    # C) 短いフレーズの高頻度再出現（鍵括弧内も区切りに含める）
+    counts = {}
+    for s in re.split(r"[。！？\n「」『』]", tail):
+        s = s.strip()
+        if len(s) >= 10:
+            counts[s] = counts.get(s, 0) + 1
+    for s, c in counts.items():
+        if c >= 5:
+            return {"unit": s, "repeats": c, "chars": len(text)}
     # B) 周期的な繰り返し（末尾区間が p 字シフトした自分自身と一致）
     n = len(text)
     for length in (2400, 1600, 800):

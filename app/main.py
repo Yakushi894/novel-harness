@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.27"
+APP_VERSION = "1.28"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -1013,12 +1013,12 @@ def chapter_page(chapter_id: int):
     rev_html = ""
     if rev_art:
         rev_html = f"""
-    <div class='card'><h2>修正概要（確認してから本文を再生成）</h2>
-    <p>使った修正要綱：{esc(rev_notes) if rev_notes else '（記録なし）'}</p>
+    <div style='border-top:1px solid #dde1e6;margin-top:1em;padding-top:.6em'><h3>修正概要（ステップ1の結果）</h3>
+    <p>修正概要に入れた文言：{esc(rev_notes) if rev_notes else '（記録なし）'}</p>
     <form method='post' action='/chapters/{ch['id']}/regen_from_rev'>
-    <div class='row'>修正概要（この内容で本文を再生成します。直接編集もできます）<textarea name='rev_outline' rows='10'>{esc(pipeline.read_text(rev_art['path']))}</textarea></div>
-    <button>ステップ2：この修正概要で本文を再生成</button></form>
-    <p>押すと修正概要を保存し、生成指示書も作り直してから本文を再生成します（別スレッド実行・Context Window の80%まで使用）。正規の章概要は変わりません。</p></div>"""
+    <div class='row'>修正された章概要（この内容で本文を再出力します。直接編集もできます）<textarea name='rev_outline' rows='10'>{esc(pipeline.read_text(rev_art['path']))}</textarea></div>
+    <button>ステップ2：この修正概要で本文を再出力</button></form>
+    <p>押すと修正概要を保存し、生成指示書も作り直してから本文を再出力します（別スレッド実行・Context Window の80%まで使用）。正規の章概要は変わりません。</p></div>"""
 
     body = f"""
     <p><a href='/works/{w['id']}'>← 作品ページ「{esc(w['title'])}」に戻る</a></p>
@@ -1043,9 +1043,9 @@ def chapter_page(chapter_id: int):
     <form method='post' action='/chapters/{ch['id']}/revise_outline'>
     <div class='row'>修正要綱（直したい点・盛り込む要素・避ける要素など）<textarea name='notes' rows='5' placeholder='例：灯台守の口調を資料どおり敬語に寄せる。手紙の伏線をもう一度置く。戦闘描写は短く。'></textarea></div>
     <button>ステップ1：修正要綱から修正概要を作成</button></form>
-    <p>まず修正要綱に沿って章概要を作り直した「修正概要」を作成します。内容を確認・編集してよければ、ステップ2で本文を再生成してください。本文の再生成で本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
-    <div id='dyn-jobs'>{job_html}</div></div>
-    {rev_html}"""
+    <p>まず修正要綱に沿って章概要を作り直した「修正概要」を作成します。内容を確認・編集してよければ、ステップ2で本文を再出力してください。本文の再出力で本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
+    {rev_html}
+    <div id='dyn-jobs'>{job_html}</div></div>"""
     live_on = active or bool(live_html) or ch["status"] in ("generating", "revising")
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
