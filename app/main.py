@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.18"
+APP_VERSION = "1.19"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -537,10 +537,10 @@ def work_detail(work_id: int):
                                f"<input type='hidden' name='chapter_id' value='{ch['id']}'>"
                                f"<button style='background:#2e7d32;border-color:#2e7d32'>OK：第{ch['number'] + 1}章以降を再生成（開始状態の引き継ぎを反映）</button></form>")
             plan_block = f"""
-        <details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>{sec_html}
         <form method='post' action='/chapters/{ch['id']}/plan_regen'>
-        <div class='row'>追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
-        <button>追加指定でこの章の計画を再生成</button></form>{cascade_btn}</details>"""
+        <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
+        <button>追加指定を考慮して再生成</button></form>{cascade_btn}
+        <details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>{sec_html}</details>"""
         ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3>第{ch['number']}章 {esc(ch['title'])}（{esc(ch['status'])}）</h3>
         {chars_note}
         <form method='post' action='/chapters/{ch['id']}'>
@@ -896,10 +896,19 @@ def chapter_page(chapter_id: int):
     plan_secs_ch = pipeline.get_plan(w, ch)
     plan_html = ""
     if plan_secs_ch:
+        pending_ch = db.get_setting(f"plan_pending:{w['id']}", "")
+        max_num_ch = db.one("SELECT MAX(number) AS m FROM chapters WHERE work_id=?", (w["id"],))["m"] or 0
+        cascade_ch = ""
+        if pending_ch == str(ch["number"]) and ch["number"] < max_num_ch:
+            cascade_ch = (f"<form method='post' action='/works/{w['id']}/plan_cascade'>"
+                          f"<input type='hidden' name='chapter_id' value='{ch['id']}'>"
+                          f"<button style='background:#2e7d32;border-color:#2e7d32'>OK：第{ch['number'] + 1}章以降を再生成（開始状態の引き継ぎを反映）</button></form>")
         plan_html = ("<div class='card'><h2>展開計画</h2>" + "".join(
             f"<h3>{esc(name)}</h3><pre>{esc(plan_secs_ch[name])}</pre>"
             for name in pipeline.PLAN_SECTIONS if plan_secs_ch.get(name))
-            + "<p>追加指定での作り直しと、OK後の次章以降の再生成は作品ページの章カードから行えます。</p></div>")
+            + f"""<form method='post' action='/chapters/{ch['id']}/plan_regen'>
+            <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
+            <button>追加指定を考慮して再生成</button></form>{cascade_ch}</div>""")
     state_html = ""
     if in_state or out_state:
         state_html = "<div class='card'><h2>状態（状態チェーン）</h2>"
