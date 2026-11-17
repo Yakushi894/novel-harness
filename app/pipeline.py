@@ -470,22 +470,74 @@ def do_analyze(job, work):
     notify(f"【小説ハーネス】「{work['title']}」の初期文書解析が完了しました。解析結果と現在の状態が以降の生成に反映されます。")
 
 
+_KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _kanji_to_int(s):
+    if s in _KANJI_NUM:
+        return _KANJI_NUM[s]
+    if "十" in s:
+        a, _, b = s.partition("十")
+        return (_KANJI_NUM.get(a, 1) if a else 1) * 10 + (_KANJI_NUM.get(b, 0) if b else 0)
+    return None
+
+
+def parse_outline_text(text):
+    """概要テキストから (章番号, タイトル, 本文) を抽出する。形式の揺れに強くする。
+
+    本命は「第N章 タイトル」見出し。漢数字（第一章）や markdown 見出し等でも拾う。
+    """
+    text = text or ""
+    found = re.findall(r"第(\d+)章[ 　]*(.*?)\n(.*?)(?=第\d+章|\Z)", text, re.S)
+    if found:
+        return found
+
+    def _sub(m):
+        n = _kanji_to_int(m.group(1))
+        return f"第{n}章" if n else m.group(0)
+
+    t2 = re.sub(r"第([一二三四五六七八九十]+)章", _sub, text)
+    found = re.findall(r"第(\d+)章[ 　]*(.*?)\n(.*?)(?=第\d+章|\Z)", t2, re.S)
+    if found:
+        return found
+    parts = re.split(r"^.*第(\d+)章[ 　]*(.*?)$", text, flags=re.M)
+    out = []
+    it = iter(parts[1:])
+    for num, title, body in zip(it, it, it):
+        if body.strip():
+            out.append((num, title, body))
+    return out
+
+
 def do_outline(job, work):
     """次章の内容：各章概要を一括生成する。"""
     try:
         run_term_check(work)
     except Exception:
         pass
+    user = prompts.OUTLINE_USER.format(
+        request=work["request"], settings=settings_text(work),
+        source="", num_chapters=work["num_chapters"])
     text = llm.chat(
-        "auto", prompts.OUTLINE_SYSTEM + sys_note(work),
-        prompts.OUTLINE_USER.format(
-            request=work["request"], settings=settings_text(work),
-            source="", num_chapters=work["num_chapters"]),
+        "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
         temperature=temperature())
-    found = re.findall(r"第(\d+)章[ 　]*(.*?)\n(.*?)(?=第\d+章|\Z)", text, re.S)
+    found = parse_outline_text(text)
     if not found:
-        raise RuntimeError("概要のパースに失敗しました")
+        # モデルが短く打ち切る・形式を崩すことがある。生出力を残し、形式を
+        # 明示して1回だけ自動リトライする。
+        save_artifact(work, None, "log", "outline_failed.txt", text)
+        retry_user = (user + "\n\n【重要】前回の出力は形式が崩れて読み取れませんでした。"
+                      "前置きや説明は書かず、必ず「第1章 タイトル」の見出し行で始め、"
+                      "全章を同じ形式で列挙してください。")
+        text = llm.chat(
+            "auto", prompts.OUTLINE_SYSTEM + sys_note(work), retry_user,
+            max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
+            temperature=temperature())
+        found = parse_outline_text(text)
+        if not found:
+            save_artifact(work, None, "log", "outline_failed.txt", text)
+            raise RuntimeError("概要のパースに失敗しました（自動リトライ1回でも読み取れず。モデルの生出力を成果物のログに保存しました）")
     if (work.get("mode") or "switch") == "single":
         found = [(1, found[0][1], found[0][2])]  # 単章モードは最初の1章だけに絞る
     db.run("DELETE FROM chapters WHERE work_id=?", (work["id"],))
@@ -577,7 +629,8 @@ def do_expand_plans(job, work):
             temperature=temperature())
         sections = parse_plan(text)
         if not sections.get("章内容詳細") or not sections.get("章終了時の状態"):
-            raise RuntimeError(f"第{ch['number']}章の展開計画のパースに失敗しました")
+            save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
+            raise RuntimeError(f"第{ch['number']}章の展開計画のパースに失敗しました（モデルの生出力を成果物のログに保存しました）")
         _save_plan(work, ch, sections)
     if payload.get("cascade"):
         db.set_setting(f"plan_pending:{work['id']}", "")
@@ -614,7 +667,8 @@ def do_regen_plan(job, work):
         temperature=temperature())
     new = parse_plan(text)
     if not new.get("章内容詳細") or not new.get("章終了時の状態"):
-        raise RuntimeError("再生成した計画のパースに失敗しました")
+        save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
+        raise RuntimeError("再生成した計画のパースに失敗しました（モデルの生出力を成果物のログに保存しました）")
     for k in ("章内容詳細", "章終了時の状態", "次章開始状態", "終了状態"):
         if new.get(k):
             sections[k] = new[k]
