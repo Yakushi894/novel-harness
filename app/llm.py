@@ -92,6 +92,18 @@ class LoopDetectedError(RuntimeError):
             f"繰り返し単位「{unit_disp}…」が約{self.repeats}回、{self.chars}文字時点で検出）")
 
 
+def _is_property_line(s):
+    """「- 所持品: 特記なし」のようなキー：値の項目行かどうか。
+
+    状態シート等では人物ごとに同じ項目行が正当に繰り返されるため、
+    ループ判定（ルールA・C）の対象から外す（2026-11-18 の誤検出対策）。
+    """
+    s = s.strip()
+    if re.match(r"^[-・*●]\s*[^:：。！？]{1,12}[:：]", s):
+        return True
+    return len(s) <= 24 and re.match(r"^[^:：。！？]{1,10}[:：]", s) is not None
+
+
 def detect_loop(text):
     """テキスト末尾の繰り返しループを検出する。検出したら dict、なければ None。
 
@@ -101,13 +113,15 @@ def detect_loop(text):
        （繰り返し回数4回以上に相当する長さがある場合のみ）
     C) 短いフレーズ（10字以上）が直近4000字以内に5回以上再出現する
        （連続していなくてもよい。会話のたびに同じ台詞が戻るタイプのループ対策）
+    ただし「- 所持品: 特記なし」のような項目行は、状態シートで人物ごとに
+    繰り返されるのが正常なため、ルールA・Cの数え上げから除外する。
     """
     if not text or len(text) < 500:
         return None
     tail = text[-4000:]
     # A) 文単位の連続繰り返し
     units = [u.strip() for u in re.split(r"(?<=[。！？])|\n", tail)]
-    units = [u for u in units if len(u) >= 10]
+    units = [u for u in units if len(u) >= 10 and not _is_property_line(u)]
     run, prev = 0, None
     for u in units:
         run = run + 1 if u == prev else 1
@@ -118,7 +132,7 @@ def detect_loop(text):
     counts = {}
     for s in re.split(r"[。！？\n「」『』]", tail):
         s = s.strip()
-        if len(s) >= 10:
+        if len(s) >= 10 and not _is_property_line(s):
             counts[s] = counts.get(s, 0) + 1
     for s, c in counts.items():
         if c >= 5:
