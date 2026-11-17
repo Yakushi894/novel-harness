@@ -260,8 +260,20 @@ def current_model():
     return m if m else "strata"
 
 
+# chat(body=True) で呼ばれた本文系呼び出しの間だけ True（呼び出しは直列前提）。
+_BODY_CALL = False
+
+
 def _check_loops(content, think):
-    """本文・thinking の両方を検査し、ループがあれば LoopDetectedError を投げる。"""
+    """本文・thinking の両方を検査し、ループがあれば LoopDetectedError を投げる。
+
+    設定で無効化できる：loop_detect=0 で全停止、loop_body_only=1 で本文系
+    呼び出し（chat の body=True）のみ検査する（状態シート等の構造化出力を守る）。
+    """
+    if _setting("loop_detect") == "0":
+        return
+    if _setting("loop_body_only") == "1" and not _BODY_CALL:
+        return
     info = detect_loop(think)
     if info:
         raise LoopDetectedError("thinking", info, content, think)
@@ -396,7 +408,7 @@ def _chat_once(payload, timeout_s):
 
 
 def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0,
-         progress=None, window=None):
+         progress=None, window=None, body=False):
     """1回のチャット補完を行い、本文テキストを返す。model=None/'auto' ならロード中モデルを使う。
 
     本文または thinking が繰り返しループに入った場合は LoopDetectedError で
@@ -406,8 +418,11 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
     各呼び出しは独立した文脈（別スレッド）で実行されるため、出力上限は対象
     ウィンドウ（window 指定時はその値、なければ設定の Context Window）の
     90%で頭打ちにする（本文生成・2次修正は呼び出し側で80%に決めている）。
+    body=True は本文系の呼び出し（本文生成・続き・2次修正）の印で、設定
+    loop_body_only=1 のときループ検出をこの呼び出しに限るために使う。
     """
-    global LAST_THINKING
+    global LAST_THINKING, _BODY_CALL
+    _BODY_CALL = body
     if model in (None, "", "auto"):
         model = current_model()
     _win = window or 0

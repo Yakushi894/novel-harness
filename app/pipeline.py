@@ -521,7 +521,7 @@ def ensure_min_chars(job, work, ch, body, progress=None):
             max_tokens=body_max_tokens(),
             temperature=temperature(),
             progress=(lambda c, t, _b=base_snapshot: progress(_b + (c or ""), t))
-            if progress else None)
+            if progress else None, body=True)
         extra = (extra or "").strip()
         if extra:
             body = body.rstrip() + "\n" + extra
@@ -955,7 +955,7 @@ def do_generate_chapters(job, work):
                     number=ch["number"], title=ch["title"], outline=ch["outline"],
                     min_chars_note=min_chars_note(work)),
                 max_tokens=body_max_tokens(),
-                temperature=temperature(), progress=pw)
+                temperature=temperature(), progress=pw, body=True)
             save_think(work, ch)
             body = ensure_min_chars(job, work, ch, body, progress=pw)
             save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
@@ -1008,7 +1008,7 @@ def revise_chapters(job, work, chapters, model_changed=False):
                     settings=settings_text(work, ctx=eff_ctx), outlines=outlines_text(work),
                     number=ch["number"], title=ch["title"], text=body),
                 max_tokens=revise_max_tokens(model_changed),
-                temperature=temperature(), progress=pw,
+                temperature=temperature(), progress=pw, body=True,
                 window=eff_ctx if model_changed else ctx_window())
             clear_partial(work, ch)
         except llm.LoopDetectedError as e:
@@ -1069,7 +1069,7 @@ def do_generate_thread(job, work):
                         number=ch["number"], title=ch["title"], outline=ch["outline"],
                         min_chars_note=min_chars_note(work)),
                     max_tokens=body_max_tokens(),
-                    temperature=temperature(), progress=pw)
+                    temperature=temperature(), progress=pw, body=True)
                 save_think(work, ch)
                 body = ensure_min_chars(job, work, ch, body, progress=pw)
                 save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
@@ -1337,7 +1337,7 @@ def do_regen_chapter(job, work):
                 outline=rev_outline or ch["outline"],
                 min_chars_note=min_chars_note(work)),
             max_tokens=body_max_tokens(),
-            temperature=temperature(), progress=pw)
+            temperature=temperature(), progress=pw, body=True)
         save_think(work, ch)
         body = ensure_min_chars(job, work, ch, body, progress=pw)
         save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
