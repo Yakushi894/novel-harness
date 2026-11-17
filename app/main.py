@@ -14,7 +14,7 @@ import time
 import zipfile
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 import db
 import llm
@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.21"
+APP_VERSION = "1.22"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -85,6 +85,7 @@ pre{white-space:pre-wrap;background:#f7f7f7;padding:1em;border-radius:8px}
 button{padding:.45em 1.1em;border:1px solid #2e6fdb;background:#2e6fdb;color:#fff;border-radius:8px;cursor:pointer}
 button:hover{background:#255cb8}
 .row{margin:.5em 0}
+summary{cursor:pointer;font-weight:600}
 .steps{color:#555}
 h1{margin-top:.2em}
 """
@@ -161,13 +162,55 @@ def sidebar(current_id=None, chapters=None) -> str:
         + ch_html
         + "<div class='side-foot'>"
         f"<div>ロード中モデル：{esc(llm.loaded_model())}</div>"
-        + _sidebar_status()
+        + f"<div id='dyn-side'>{_sidebar_status()}</div>"
         + "<div style='margin-top:.4em'><a href='/glossary'>📖 用語DB</a> ｜ <a href='/settings'>⚙ 設定</a></div>"
         "</div></div>")
 
 
-def page(title: str, body: str, current_id=None, chapters=None, refresh: bool = False) -> HTMLResponse:
-    auto = "<script>setTimeout(function(){location.reload()},5000)</script>" if refresh else ""
+POLL_SCRIPT = """
+<script>
+(function(){
+  var url = __URL__;
+  function swap(id, html){
+    var el = document.getElementById(id);
+    if(!el || el.innerHTML === html) return;
+    var opens = [];
+    var ds = el.querySelectorAll('details');
+    for(var i=0;i<ds.length;i++) opens.push(ds[i].open);
+    el.innerHTML = html;
+    var nd = el.querySelectorAll('details');
+    for(var j=0;j<nd.length && j<opens.length;j++) if(opens[j]) nd[j].open = true;
+  }
+  function tick(){
+    fetch(url).then(function(r){ return r.json(); }).then(function(j){
+      if(j.stop) return;
+      if(j.reload){ location.reload(); return; }
+      var nearBottom = (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 240);
+      var regions = j.regions || {};
+      for(var id in regions) swap(id, regions[id]);
+      var texts = j.texts || {};
+      for(var tid in texts){
+        var e = document.getElementById(tid);
+        if(e && e.textContent !== texts[tid]) e.textContent = texts[tid];
+      }
+      if(nearBottom) window.scrollTo(0, document.documentElement.scrollHeight);
+      setTimeout(tick, 4000);
+    }).catch(function(){ setTimeout(tick, 8000); });
+  }
+  setTimeout(tick, 4000);
+})();
+</script>
+"""
+
+
+def page(title: str, body: str, current_id=None, chapters=None, refresh: bool = False,
+         live_url: str = None) -> HTMLResponse:
+    if live_url:
+        auto = POLL_SCRIPT.replace("__URL__", json.dumps(live_url))
+    elif refresh:
+        auto = "<script>setTimeout(function(){location.reload()},5000)</script>"
+    else:
+        auto = ""
     return HTMLResponse(
         "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -442,6 +485,84 @@ def enqueue(work_id: int, kind: str, payload: dict | None = None):
            (work_id, kind, db.dumps(payload or {}), db.now(), db.now()))
 
 
+def _jobs_html(w, jobs) -> str:
+    """作品ページのジョブ一覧フラグメント（ページ本体と live.json で共用）。"""
+    now_ts = time.time()
+    rows = ""
+    for j in jobs:
+        if j["status"] == "running":
+            dur = f"（実行中・経過 {fmt_dur(now_ts - j['created_at'])}）"
+            if j["kind"] == "revise_all" and w["stage"] == "wait_model":
+                dur += " モデル切替待ちです：XeStrata 側でモデルを切り替えると自動で始まります（この間 running のままが正常です）"
+        elif j["status"] == "queued":
+            dur = "（待機中）"
+        elif j["status"] in ("done", "failed"):
+            dur = f"（所要 {fmt_dur(j['updated_at'] - j['created_at'])}）"
+        else:
+            dur = ""
+        rows += (
+            f"<div>#{j['id']} {esc(j['kind'])} ― {status_html(j['status'])} {dur} {esc(j['error'])}"
+            + (f" <form method='post' action='/jobs/{j['id']}/cancel' style='display:inline'><button>取消</button></form>"
+               if j["status"] in ("queued", "running") else "") + "</div>"
+            + usage_html(j))
+    return rows or "<p>なし</p>"
+
+
+def _work_head_html(w) -> str:
+    """作品ページ冒頭の状態・モデル表示フラグメント。"""
+    draft_model = db.get_setting(f"work:{w['id']}:draft_model", "")
+    revise_model = db.get_setting(f"work:{w['id']}:revise_model", "")
+    return (f"<p>状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}</p>"
+            f"<p class='steps'>工程：{' ⇒ '.join(FLOW_STEPS)}</p>"
+            f"<p>ロード中モデル：{esc(llm.loaded_model())}"
+            f" ／ 1次出力モデル：{esc(draft_model) or '―'} ／ 2次修正モデル：{esc(revise_model) or '―'}</p>")
+
+
+def _single_gen_html(w, sch) -> str:
+    """単章パネルの生成欄フラグメント（ページ本体と live.json で共用）。"""
+    if sch is None:
+        return "<p>まだ生成されていません。上の指示を送ると、概要作成から生成まで一括で進みます。</p>"
+    s_final = pipeline.latest_artifact(w["id"], sch["id"], "final")
+    s_draft = pipeline.latest_artifact(w["id"], sch["id"], "draft")
+    s_body_art = s_final or s_draft
+    s_think = pipeline.latest_artifact(w["id"], sch["id"], "think")
+    sp_body, sp_think = pipeline.read_partial(w, sch)
+    if sp_body is not None and sch["status"] in ("generating", "revising"):
+        gen_inner = (f"<p>生成中（逐次表示）：本文 {len(sp_body):,}字 ／ Think {len(sp_think or ''):,}字</p>"
+                     f"<pre>{esc(sp_body)}</pre>")
+        if sp_think:
+            gen_inner += (f"<details><summary>Think（生成中・逐次）</summary>"
+                          f"<pre>{esc(sp_think)}</pre></details>")
+        return gen_inner
+    if s_body_art:
+        gen_inner = f"<pre>{esc(pipeline.read_text(s_body_art['path']))}</pre>"
+        if s_think:
+            gen_inner += (f"<details><summary>Think（思考過程）</summary>"
+                          f"<pre>{esc(pipeline.read_text(s_think['path']))}</pre></details>")
+        return gen_inner
+    return "<p>まだ生成されていません。上の指示を送ると生成が始まります。</p>"
+
+
+def _chapter_live_html(w, ch) -> str:
+    """章ページの生成中（逐次表示）カード。生成中でなければ空文字。"""
+    partial_body, partial_think = pipeline.read_partial(w, ch)
+    if partial_body is None or ch["status"] not in ("generating", "revising"):
+        return ""
+    live_think = (f"<details><summary>Think（生成中・逐次）</summary><pre>{esc(partial_think)}</pre></details>"
+                  if partial_think else "")
+    return (f"<div class='card' style='border:2px solid #e8b34b'><h2>生成中（逐次表示）</h2>"
+            f"<p>本文 {len(partial_body):,}字 ／ Think {len(partial_think or ''):,}字"
+            "（このページは自動更新されます。ブラウザを閉じても生成は続きます）</p>"
+            f"<pre>{esc(partial_body)}</pre>{live_think}</div>")
+
+
+def _chapter_jobs_html(jobs) -> str:
+    """章ページの再生成ジョブ一覧フラグメント。"""
+    return "".join(
+        f"<div>#{j['id']} 再生成 ― {status_html(j['status'])} {esc(j['error'])}</div>" + usage_html(j)
+        for j in jobs)
+
+
 @app.get("/works/{work_id}")
 def work_detail(work_id: int):
     w = db.one("SELECT * FROM works WHERE id=?", (work_id,))
@@ -505,17 +626,17 @@ def work_detail(work_id: int):
 
     analysis_html = ""
     if analysis:
-        analysis_html = (f"<div class='card'><h3>初期文書解析の結果</h3>"
+        analysis_html = (f"<details class='card'><summary>初期文書解析の結果</summary>"
                          f"<pre>{esc(pipeline.read_text(analysis['path']))}</pre>"
-                         "<p>この解析結果は、以降の生成（概要・本文・修正）の文脈に自動で含まれます。</p></div>")
+                         "<p>この解析結果は、以降の生成（概要・本文・修正）の文脈に自動で含まれます。</p></details>")
 
     state_now = pipeline.current_state(w)
     state_html = ""
     if state_now:
-        state_html = (f"<div class='card'><h2>現在の状態（状態チェーン）</h2>"
+        state_html = (f"<details class='card'><summary>現在の状態（状態チェーン）</summary>"
                       f"<pre>{esc(state_now)}</pre>"
                       "<p>各章は開始時点の状態を入力として受け取り、終了状態を次章へ渡します。"
-                      "章ごとの入出力状態は各章ページで確認できます。</p></div>")
+                      "章ごとの入出力状態は各章ページで確認できます。</p></details>")
 
     min_chars = int(w.get("min_chars") or 0)
     plan_pending = db.get_setting(f"plan_pending:{work_id}", "")
@@ -541,7 +662,7 @@ def work_detail(work_id: int):
         <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
         <button>追加指定を考慮して再生成</button></form>{cascade_btn}
         <details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>{sec_html}</details>"""
-        ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3>第{ch['number']}章 {esc(ch['title'])}（{esc(ch['status'])}）</h3>
+        ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3>第{ch['number']}章 {esc(ch['title'])}（<span id='ch-status-{ch['number']}'>{esc(ch['status'])}</span>）</h3>
         {chars_note}
         <form method='post' action='/chapters/{ch['id']}'>
         <div class='row'>タイトル<input type='text' name='title' value="{esc(ch['title'])}"></div>
@@ -564,27 +685,7 @@ def work_detail(work_id: int):
         src_names = "".join(
             f"<div>📄 {esc(os.path.basename(a['path']))}</div>"
             for a in arts if a["kind"] == "source")
-        if sch is None:
-            gen_inner = "<p>まだ生成されていません。上の指示を送ると、概要作成から生成まで一括で進みます。</p>"
-        else:
-            s_final = pipeline.latest_artifact(w["id"], sch["id"], "final")
-            s_draft = pipeline.latest_artifact(w["id"], sch["id"], "draft")
-            s_body_art = s_final or s_draft
-            s_think = pipeline.latest_artifact(w["id"], sch["id"], "think")
-            sp_body, sp_think = pipeline.read_partial(w, sch)
-            if sp_body is not None and sch["status"] in ("generating", "revising"):
-                gen_inner = (f"<p>生成中（逐次表示）：本文 {len(sp_body):,}字 ／ Think {len(sp_think or ''):,}字</p>"
-                             f"<pre>{esc(sp_body)}</pre>")
-                if sp_think:
-                    gen_inner += (f"<details><summary>Think（生成中・逐次）</summary>"
-                                  f"<pre>{esc(sp_think)}</pre></details>")
-            elif s_body_art:
-                gen_inner = f"<pre>{esc(pipeline.read_text(s_body_art['path']))}</pre>"
-                if s_think:
-                    gen_inner += (f"<details><summary>Think（思考過程）</summary>"
-                                  f"<pre>{esc(pipeline.read_text(s_think['path']))}</pre></details>")
-            else:
-                gen_inner = "<p>まだ生成されていません。上の指示を送ると生成が始まります。</p>"
+        gen_inner = _single_gen_html(w, sch)
         single_html = f"""
     <div class='card'><h2>単章モード</h2>
     <h3>指示</h3>
@@ -594,7 +695,7 @@ def work_detail(work_id: int):
     {('<p>添付済み：</p>' + src_names) if src_names else ''}
     <button>生成する</button></form>
     <h3>生成欄</h3>
-    {gen_inner}
+    <div id='dyn-single'>{gen_inner}</div>
     </div>"""
 
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
@@ -603,25 +704,7 @@ def work_detail(work_id: int):
         notice_html = ("<div class='card'><h2>お知らせ（用語DB）</h2>" + "".join(
             f"<div>{esc(n['body'])}</div>" for n in notices) + "</div>")
 
-    now_ts = time.time()
-    job_rows = ""
-    for j in jobs:
-        if j["status"] == "running":
-            dur = f"（実行中・経過 {fmt_dur(now_ts - j['created_at'])}）"
-            if j["kind"] == "revise_all" and w["stage"] == "wait_model":
-                dur += " モデル切替待ちです：XeStrata 側でモデルを切り替えると自動で始まります（この間 running のままが正常です）"
-        elif j["status"] == "queued":
-            dur = "（待機中）"
-        elif j["status"] in ("done", "failed"):
-            dur = f"（所要 {fmt_dur(j['updated_at'] - j['created_at'])}）"
-        else:
-            dur = ""
-        job_rows += (
-            f"<div>#{j['id']} {esc(j['kind'])} ― {status_html(j['status'])} {dur} {esc(j['error'])}"
-            + (f" <form method='post' action='/jobs/{j['id']}/cancel' style='display:inline'><button>取消</button></form>"
-               if j["status"] in ("queued", "running") else "") + "</div>"
-            + usage_html(j))
-    job_html = job_rows
+    job_html = _jobs_html(w, jobs)
     art_html = "".join(
         f"<div><a href='/artifacts/{a['id']}'>"
         + ("log（異常終了ログ）" if a["kind"] == "log" else esc(a["kind"]))
@@ -638,10 +721,7 @@ def work_detail(work_id: int):
         source_html = "<p>アップロード済みファイル：</p>" + source_html
 
     body = f"""
-    <p>状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}</p>
-    <p class='steps'>工程：{' ⇒ '.join(FLOW_STEPS)}</p>
-    <p>ロード中モデル：{esc(llm.loaded_model())}
-    ／ 1次出力モデル：{esc(draft_model) or '―'} ／ 2次修正モデル：{esc(revise_model) or '―'}</p>
+    <div id='dyn-head'>{_work_head_html(w)}</div>
     {fanfic_html}
     <div class='card'><h2>1. 続き読み込み（素材ファイル：Txt等）</h2>
     <form method='post' action='/works/{w['id']}/upload' enctype='multipart/form-data'>
@@ -663,7 +743,7 @@ def work_detail(work_id: int):
     {single_html}
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p></div>
     <h2>章と概要</h2>{ch_html or '<p>まだ概要がありません。</p>'}
-    <div class='card'><h2>ジョブ</h2>{job_html or '<p>なし</p>'}</div>
+    <div class='card'><h2>ジョブ</h2><div id='dyn-jobs'>{job_html}</div></div>
     <div class='card'><h2>成果物</h2>{art_html or '<p>なし</p>'}</div>
     <div class='card'><h2>作品情報</h2>
     <form method='post' action='/works/{w['id']}/meta'>
@@ -682,7 +762,8 @@ def work_detail(work_id: int):
     <p>作品データは消えますが、<b>用語DBに覚えた単語の意味は残ります</b>（次回から再検索せず使えます）。</p></div>"""
     active = any(j["status"] in ("queued", "running") for j in jobs)
     return page(w["title"], body + DROP_SCRIPT_WORK.replace("__WID__", str(work_id)),
-                current_id=work_id, chapters=chapters, refresh=active)
+                current_id=work_id, chapters=chapters,
+                live_url=f"/works/{work_id}/live.json" if active else None)
 
 
 @app.post("/works/{work_id}/delete")
@@ -872,23 +953,13 @@ def chapter_page(chapter_id: int):
     jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind='regen_chapter' ORDER BY id DESC LIMIT 3",
                 (w["id"],))
     active = any(j["status"] in ("queued", "running") for j in jobs)
-    job_html = "".join(
-        f"<div>#{j['id']} 再生成 ― {status_html(j['status'])} {esc(j['error'])}</div>" + usage_html(j)
-        for j in jobs)
+    job_html = _chapter_jobs_html(jobs)
 
     body_html = (f"<pre>{esc(pipeline.read_text(body_art['path']))}</pre>"
                  if body_art else "<p>まだ生成されていません。</p>")
     think_html = (f"<details class='card'><summary>Think（思考過程）</summary>"
                   f"<pre>{esc(pipeline.read_text(think['path']))}</pre></details>") if think else ""
-    partial_body, partial_think = pipeline.read_partial(w, ch)
-    live_html = ""
-    if partial_body is not None and ch["status"] in ("generating", "revising"):
-        live_think = (f"<details><summary>Think（生成中・逐次）</summary><pre>{esc(partial_think)}</pre></details>"
-                      if partial_think else "")
-        live_html = (f"<div class='card' style='border:2px solid #e8b34b'><h2>生成中（逐次表示）</h2>"
-                     f"<p>本文 {len(partial_body):,}字 ／ Think {len(partial_think or ''):,}字"
-                     "（このページは自動更新されます。ブラウザを閉じても生成は続きます）</p>"
-                     f"<pre>{esc(partial_body)}</pre>{live_think}</div>")
+    live_html = _chapter_live_html(w, ch)
     loop_log_html = (f"<div class='card' style='border:2px solid #b03a3a'><h2>異常終了ログ（生成ループ）</h2>"
                      f"<pre>{esc(pipeline.read_text(loop_log['path']))}</pre></div>") if loop_log else ""
     design_html = (f"<details class='card'><summary>生成指示書</summary>"
@@ -911,12 +982,12 @@ def chapter_page(chapter_id: int):
             <button>追加指定を考慮して再生成</button></form>{cascade_ch}</div>""")
     state_html = ""
     if in_state or out_state:
-        state_html = "<div class='card'><h2>状態（状態チェーン）</h2>"
+        state_html = "<details class='card'><summary>状態（状態チェーン）</summary>"
         if in_state:
             state_html += f"<h3>入力状態（この章の開始時点）</h3><pre>{esc(in_state)}</pre>"
         if out_state:
             state_html += f"<h3>終了状態（この章の終了時点・次章へ渡す）</h3><pre>{esc(out_state)}</pre>"
-        state_html += "</div>"
+        state_html += "</details>"
 
     body = f"""
     <p><a href='/works/{w['id']}'>← 作品ページ「{esc(w['title'])}」に戻る</a></p>
@@ -926,9 +997,9 @@ def chapter_page(chapter_id: int):
     <div class='row'>概要<textarea name='outline' rows='5'>{esc(ch['outline'])}</textarea></div>
     <button>概要を保存（承認）</button></form></div>
     <div class='card'><h2>{body_label}</h2>
-    <p>文字数：{chars}文字{'（最低' + str(min_chars) + '文字）' if min_chars > 0 else ''} ／ 状態：{esc(ch['status'])}</p>
+    <p>文字数：{chars}文字{'（最低' + str(min_chars) + '文字）' if min_chars > 0 else ''} ／ 状態：<span id='ch-status-self'>{esc(ch['status'])}</span></p>
     {body_html}</div>
-    {live_html}
+    <div id='dyn-live'>{live_html}</div>
     {loop_log_html}
     {plan_html}
     {think_html}
@@ -939,10 +1010,52 @@ def chapter_page(chapter_id: int):
     <div class='row'>修正要綱（直したい点・盛り込む要素・避ける要素など）<textarea name='notes' rows='5' placeholder='例：灯台守の口調を資料どおり敬語に寄せる。手紙の伏線をもう一度置く。戦闘描写は短く。'></textarea></div>
     <button>修正要綱を含んでこの章を再生成</button></form>
     <p>再生成すると本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
-    {job_html}</div>"""
+    <div id='dyn-jobs'>{job_html}</div></div>"""
+    live_on = active or bool(live_html) or ch["status"] in ("generating", "revising")
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
-                refresh=active or bool(live_html) or ch["status"] in ("generating", "revising"))
+                live_url=f"/chapters/{chapter_id}/live.json" if live_on else None)
+
+
+@app.get("/works/{work_id}/live.json")
+def work_live(work_id: int):
+    """作品ページの非同期更新用。動的フラグメントだけを返し、ページ全体は再読み込みしない。
+    ジョブが無くなったら reload=true を返し、クライアントが1回だけ再読み込みして確定表示にする。"""
+    w = db.one("SELECT * FROM works WHERE id=?", (work_id,))
+    if not w:
+        return JSONResponse({"stop": True})
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work_id,))
+    jobs = db.q("SELECT * FROM jobs WHERE work_id=? ORDER BY id DESC LIMIT 10", (work_id,))
+    active = any(j["status"] in ("queued", "running") for j in jobs)
+    regions = {
+        "dyn-head": _work_head_html(w),
+        "dyn-jobs": _jobs_html(w, jobs),
+        "dyn-side": _sidebar_status(),
+    }
+    if (w.get("mode") or "switch") == "single":
+        regions["dyn-single"] = _single_gen_html(w, chapters[0] if chapters else None)
+    texts = {f"ch-status-{c['number']}": c["status"] for c in chapters}
+    return JSONResponse({"reload": not active, "regions": regions, "texts": texts})
+
+
+@app.get("/chapters/{chapter_id}/live.json")
+def chapter_live(chapter_id: int):
+    """章ページの非同期更新用。生成中カードとジョブ・状態だけを返す。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return JSONResponse({"stop": True})
+    w = db.one("SELECT * FROM works WHERE id=?", (ch["work_id"],))
+    jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind='regen_chapter' ORDER BY id DESC LIMIT 3",
+                (w["id"],))
+    active = (any(j["status"] in ("queued", "running") for j in jobs)
+              or ch["status"] in ("generating", "revising"))
+    regions = {
+        "dyn-live": _chapter_live_html(w, ch),
+        "dyn-jobs": _chapter_jobs_html(jobs),
+        "dyn-side": _sidebar_status(),
+    }
+    return JSONResponse({"reload": not active, "regions": regions,
+                         "texts": {"ch-status-self": ch["status"]}})
 
 
 @app.post("/chapters/{chapter_id}/plan_regen")
