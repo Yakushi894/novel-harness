@@ -41,7 +41,9 @@ def allocate_tokens(ctx):
     合計で配り合う必要はなく、作業のまとまりごとに枠を決める：
     章概要作成（全体概要・章ごとの概要・修正概要・展開計画）90%／
     初期読み込み・生成指示書（文書解析＋指示書。解析は出力が長くなりがちで
-    実測約17,000トークン）45%／本文生成80%／要約・状態更新3%（短い出力用）／
+    実測約17,000トークン）45%／本文生成80%／要約・状態更新10%（章の終了後に
+    次章へ渡す要約と状態スナップショットを作る工程。状態は登場人物・関係・
+    伏線を詳細に記録するため、思考分も含めて余裕を持たせる）／
     2次修正80%（この ctx 基準の値。実行時は対象ウィンドウの80%を使う）。
     256 単位に丸め、工程ごとの下限を保証する。
     """
@@ -51,22 +53,27 @@ def allocate_tokens(ctx):
         "max_tokens_outline": _v(0.90, 4096),
         "max_tokens_design": _v(0.45, 4096),
         "max_tokens_chapter": _v(0.80, 4096),
-        "max_tokens_summary": _v(0.03, 2048),
+        "max_tokens_summary": _v(0.10, 4096),
         "max_tokens_revise": _v(0.80, 4096),
     }
 
 
-def ensure_alloc_v2():
-    """配分見直し（v1.25）への一回限りの移行。
+def ensure_alloc_v3():
+    """配分見直しへの一回限りの移行（v1.25で導入、v1.26で要約枠を10%に拡大）。
 
-    旧配分（概要10%／指示書・解析5%など）で保存された Max Tokens を、新しい
-    配分で一度だけ上書きする。以後の手動調整には干渉しない。
+    v1.25 未導入の環境では全項目を新配分で上書きし、v1.25 導入済みの環境では
+    要約・状態更新の枠だけを新しい値に更新する（他の手動調整には干渉しない）。
     """
-    if db.get_setting("alloc_v2", ""):
+    if db.get_setting("alloc_v3", ""):
         return
-    for key, val in allocate_tokens(ctx_window()).items():
-        db.set_setting(key, str(val))
+    alloc = allocate_tokens(ctx_window())
+    if db.get_setting("alloc_v2", ""):
+        db.set_setting("max_tokens_summary", str(alloc["max_tokens_summary"]))
+    else:
+        for key, val in alloc.items():
+            db.set_setting(key, str(val))
     db.set_setting("alloc_v2", "1")
+    db.set_setting("alloc_v3", "1")
 
 
 def body_max_tokens():
