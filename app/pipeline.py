@@ -102,9 +102,73 @@ def tail_chars():
 
 def work_dir(slug):
     d = os.path.join(WORKS_DIR, slug)
-    for sub in ("source", "prompts", "drafts", "summaries", "revised", "final", "states", "thinking", "logs"):
+    for sub in ("source", "prompts", "drafts", "summaries", "revised", "final", "states", "thinking", "logs", "live"):
         os.makedirs(os.path.join(d, sub), exist_ok=True)
     return d
+
+
+# ---------- 生成中の逐次表示（ライブ部分保存） ----------
+# 生成はコンテナ内のワーカーで進むため、ブラウザを閉じても・セッションが切れても
+# 推論とループ検出は継続する。途中経過はここに保存され、画面側はそれを読むだけ。
+
+def _partial_files(work, ch):
+    d = os.path.join(work_dir(work["slug"]), "live")
+    return (os.path.join(d, f"ch{ch['number']:03d}_body.txt"),
+            os.path.join(d, f"ch{ch['number']:03d}_think.txt"))
+
+
+def save_partial(work, ch, label, body, think):
+    bp, tp = _partial_files(work, ch)
+    for path, text in ((bp, body), (tp, think)):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text or "")
+        os.replace(tmp, path)
+    db.set_setting("live:work_id", str(work["id"]))
+    db.set_setting("live:chapter", str(ch["number"]))
+    db.set_setting("live:label", label)
+    db.set_setting("live:body_chars", str(len(body or "")))
+    db.set_setting("live:think_chars", str(len(think or "")))
+    db.set_setting("live:at", str(time.time()))
+
+
+def read_partial(work, ch):
+    bp, tp = _partial_files(work, ch)
+    if not os.path.isfile(bp):
+        return None, None
+    return read_text(bp), (read_text(tp) if os.path.isfile(tp) else "")
+
+
+def clear_partial(work, ch):
+    for path in _partial_files(work, ch):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if db.get_setting("live:work_id", "") == str(work["id"]) \
+            and db.get_setting("live:chapter", "") == str(ch["number"]):
+        for k in ("live:work_id", "live:chapter", "live:label",
+                  "live:body_chars", "live:think_chars", "live:at"):
+            db.set_setting(k, "")
+
+
+def progress_writer(work, ch, label, base_body=""):
+    """llm.chat の progress コールバック。間引きながら途中経過を保存する。"""
+    state = {"chars": 0, "at": 0.0}
+
+    def write(content, think):
+        total = len(base_body) + len(content or "") + len(think or "")
+        now = time.time()
+        if total - state["chars"] < 1000 and now - state["at"] < 2.0:
+            return
+        state["chars"] = total
+        state["at"] = now
+        try:
+            save_partial(work, ch, label, base_body + (content or ""), think or "")
+        except Exception:
+            pass
+
+    return write
 
 
 def save_artifact(work, chapter, kind, filename, text):
@@ -320,7 +384,7 @@ def chapter_chars(work_id, chapter_id):
     return 0
 
 
-def ensure_min_chars(job, work, ch, body):
+def ensure_min_chars(job, work, ch, body, progress=None):
     """本文が最低文字数に届くまで、続きを自動で書き足す。
 
     v1.12 で仕様変更：従来は最大5回で打ち切り、届かなくてもそのまま
@@ -345,6 +409,7 @@ def ensure_min_chars(job, work, ch, body):
             raise llm.JobCancelledError("ユーザーにより停止されました")
         rounds += 1
         need = target - len(body)
+        base_snapshot = body
         extra = llm.chat(
             "auto", prompts.CONTINUE_SYSTEM + sys_note(work),
             prompts.CONTINUE_USER.format(
@@ -355,7 +420,9 @@ def ensure_min_chars(job, work, ch, body):
                 current=len(body), target=target,
                 need=need, round_min=min(need, 3000)),
             max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
-            temperature=temperature())
+            temperature=temperature(),
+            progress=(lambda c, t, _b=base_snapshot: progress(_b + (c or ""), t))
+            if progress else None)
         extra = (extra or "").strip()
         if extra:
             body = body.rstrip() + "\n" + extra
@@ -455,6 +522,7 @@ def do_generate_chapters(job, work):
         if ch["status"] == "generated":
             continue
         set_chapter_status(ch["id"], "generating")
+        pw = progress_writer(work, ch, "1次出力")
         try:
             instruction = design_prompt(work, ch, work["request"])
             used_model = llm.current_model()
@@ -470,10 +538,11 @@ def do_generate_chapters(job, work):
                     number=ch["number"], title=ch["title"], outline=ch["outline"],
                     min_chars_note=min_chars_note(work)),
                 max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
-                temperature=temperature())
+                temperature=temperature(), progress=pw)
             save_think(work, ch)
-            body = ensure_min_chars(job, work, ch, body)
+            body = ensure_min_chars(job, work, ch, body, progress=pw)
             save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+            clear_partial(work, ch)
             db.set_setting(f"work:{work['id']}:draft_model", used_model)
             update_state(work, ch, body, prev_state)
             summary = llm.chat(
@@ -485,10 +554,15 @@ def do_generate_chapters(job, work):
             set_chapter_status(ch["id"], "generated")
         except llm.LoopDetectedError as e:
             save_loop_log(work, ch, "1次出力", e)
+            clear_partial(work, ch)
             set_chapter_status(ch["id"], "outlined")
             raise
         except llm.JobCancelledError:
+            clear_partial(work, ch)
             set_chapter_status(ch["id"], "outlined")
+            raise
+        except Exception:
+            clear_partial(work, ch)
             raise
     set_stage(work["id"], "wait_model")
     notify(f"【小説ハーネス】「{work['title']}」の1次出力が終了しました（使用モデル：{llm.loaded_model()}）。"
@@ -509,6 +583,7 @@ def revise_chapters(job, work, chapters, model_changed=False):
         set_chapter_status(ch["id"], "revising")
         draft = latest_artifact(work["id"], ch["id"], "draft")
         body = read_text(draft["path"]) if draft else ""
+        pw = progress_writer(work, ch, "2次修正")
         try:
             revised = llm.chat(
                 "auto", prompts.REVISE_SYSTEM + sys_note(work),
@@ -516,13 +591,19 @@ def revise_chapters(job, work, chapters, model_changed=False):
                     settings=settings_text(work, ctx=eff_ctx), outlines=outlines_text(work),
                     number=ch["number"], title=ch["title"], text=body),
                 max_tokens=revise_max_tokens(model_changed),
-                temperature=temperature())
+                temperature=temperature(), progress=pw)
+            clear_partial(work, ch)
         except llm.LoopDetectedError as e:
             save_loop_log(work, ch, "2次修正", e)
+            clear_partial(work, ch)
             set_chapter_status(ch["id"], "generated")
             raise
         except llm.JobCancelledError:
+            clear_partial(work, ch)
             set_chapter_status(ch["id"], "generated")
+            raise
+        except Exception:
+            clear_partial(work, ch)
             raise
         target = work_min_chars(work)
         if target > 0 and len(revised) < target:
@@ -554,6 +635,7 @@ def do_generate_thread(job, work):
             return
         if ch["status"] != "generated":
             set_chapter_status(ch["id"], "generating")
+            pw = progress_writer(work, ch, "生成")
             try:
                 instruction = design_prompt(work, ch, work["request"], use_tail=False)
                 used_model = llm.current_model()
@@ -569,10 +651,11 @@ def do_generate_thread(job, work):
                         number=ch["number"], title=ch["title"], outline=ch["outline"],
                         min_chars_note=min_chars_note(work)),
                     max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
-                    temperature=temperature())
+                    temperature=temperature(), progress=pw)
                 save_think(work, ch)
-                body = ensure_min_chars(job, work, ch, body)
+                body = ensure_min_chars(job, work, ch, body, progress=pw)
                 save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+                clear_partial(work, ch)
                 db.set_setting(f"work:{work['id']}:draft_model", used_model)
                 update_state(work, ch, body, prev_state)
                 summary = llm.chat(
@@ -584,10 +667,15 @@ def do_generate_thread(job, work):
                 set_chapter_status(ch["id"], "generated")
             except llm.LoopDetectedError as e:
                 save_loop_log(work, ch, "スレッド生成", e)
+                clear_partial(work, ch)
                 set_chapter_status(ch["id"], "outlined")
                 raise
             except llm.JobCancelledError:
+                clear_partial(work, ch)
                 set_chapter_status(ch["id"], "outlined")
+                raise
+            except Exception:
+                clear_partial(work, ch)
                 raise
             ch = dict(ch, status="generated")
         if not revise_chapters(job, work, [ch]):
@@ -798,6 +886,7 @@ def do_regen_chapter(job, work):
     if notes:
         instruction = (instruction + f"\n\n【修正要綱】\n{notes}").strip()
     prev_state = current_state(work, ch["number"])
+    pw = progress_writer(work, ch, "再生成")
     try:
         body = llm.chat(
             "auto", prompts.CHAPTER_SYSTEM + sys_note(work),
@@ -810,10 +899,11 @@ def do_regen_chapter(job, work):
                 number=ch["number"], title=ch["title"], outline=ch["outline"],
                 min_chars_note=min_chars_note(work)),
             max_tokens=max_tokens("max_tokens_chapter", "MAX_TOKENS_CHAPTER", 32768),
-            temperature=temperature())
+            temperature=temperature(), progress=pw)
         save_think(work, ch)
-        body = ensure_min_chars(job, work, ch, body)
+        body = ensure_min_chars(job, work, ch, body, progress=pw)
         save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+        clear_partial(work, ch)
         for kind in ("revised", "final"):
             for a in db.q("SELECT * FROM artifacts WHERE work_id=? AND chapter_id=? AND kind=?",
                           (work["id"], ch["id"], kind)):
@@ -831,10 +921,15 @@ def do_regen_chapter(job, work):
         save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
     except llm.LoopDetectedError as e:
         save_loop_log(work, ch, "章の再生成", e)
+        clear_partial(work, ch)
         set_chapter_status(ch["id"], prev_status)
         raise
     except llm.JobCancelledError:
+        clear_partial(work, ch)
         set_chapter_status(ch["id"], prev_status)
+        raise
+    except Exception:
+        clear_partial(work, ch)
         raise
     set_chapter_status(ch["id"], "generated")
     notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章を修正要綱つきで再生成しました。")
@@ -873,6 +968,21 @@ def _usage_sink_for(job_id):
             acc["model"] = rec["model"]
         db.run("UPDATE jobs SET usage=? WHERE id=?",
                (json.dumps(acc, ensure_ascii=False), job_id))
+        # サイドバー表示用：直近の呼び出しのコンテキスト量と処理速度を全体にも残す
+        try:
+            if isinstance(rec.get("prompt_tokens"), int):
+                db.set_setting("live:prompt_tokens", str(rec["prompt_tokens"]))
+            if isinstance(rec.get("completion_tokens"), int):
+                db.set_setting("live:completion_tokens", str(rec["completion_tokens"]))
+            if isinstance(rec.get("prefill_tps"), (int, float)):
+                db.set_setting("live:prefill_tps", f"{rec['prefill_tps']:.1f}")
+            if isinstance(rec.get("decode_tps"), (int, float)):
+                db.set_setting("live:decode_tps", f"{rec['decode_tps']:.1f}")
+            if rec.get("model"):
+                db.set_setting("live:model", str(rec["model"]))
+            db.set_setting("live:call_at", str(time.time()))
+        except Exception:
+            pass
     return sink
 
 

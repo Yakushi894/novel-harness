@@ -167,10 +167,14 @@ def _report_usage(j, max_tokens):
     u = j.get("usage") or {}
     details = u.get("completion_tokens_details") or {}
     rt = details.get("reasoning_tokens", u.get("reasoning_tokens"))
+    # llama.cpp 系サーバーが返す処理速度（プリフィル／デコード）。無いサーバーでは None。
+    tm = j.get("timings") or {}
     rec = {
         "prompt_tokens": u.get("prompt_tokens"),
         "completion_tokens": u.get("completion_tokens"),
         "reasoning_tokens": rt if isinstance(rt, int) else None,
+        "prefill_tps": tm.get("prompt_per_second") if isinstance(tm.get("prompt_per_second"), (int, float)) else None,
+        "decode_tps": tm.get("predicted_per_second") if isinstance(tm.get("predicted_per_second"), (int, float)) else None,
         "max_tokens": max_tokens,
         "model": j.get("model"),
     }
@@ -213,13 +217,13 @@ def _check_loops(content, think):
         raise LoopDetectedError("本文", info, content, think)
 
 
-def _chat_streaming(payload, model, max_tokens, timeout_s):
+def _chat_streaming(payload, model, max_tokens, timeout_s, progress=None):
     """ストリーミング受信。戻り値は応答 JSON 相当の dict（message を組み立て済み）。
 
-    生成中に一定量たまるたびループ検査をし、検出したら接続を切って
-    LoopDetectedError を投げる。ストリーミングが使えない応答（エラー応答、
-    空応答、SSE でない形式など）の場合は _StreamUnsupported を投げ、
-    呼び出し側が一括受信にフォールバックする。
+    生成中に一定量（200字）たまるたびループ検査と進捗通知（progress）をし、
+    ループを検出したら接続を切って LoopDetectedError を投げる。
+    ストリーミングが使えない応答（エラー応答、空応答、SSE でない形式など）の
+    場合は _StreamUnsupported を投げ、呼び出し側が一括受信にフォールバックする。
     """
     body = dict(payload)
     body["stream"] = True
@@ -230,6 +234,7 @@ def _chat_streaming(payload, model, max_tokens, timeout_s):
     cancel_mark = 0
     cancel_clock = time.time()
     usage = None
+    timings = None
     chunks = 0
     try:
         with httpx.Client(timeout=timeout_s) as client:
@@ -255,6 +260,8 @@ def _chat_streaming(payload, model, max_tokens, timeout_s):
                     chunks += 1
                     if chunk.get("usage"):
                         usage = chunk["usage"]
+                    if chunk.get("timings"):
+                        timings = chunk["timings"]
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -267,9 +274,14 @@ def _chat_streaming(payload, model, max_tokens, timeout_s):
                     if t:
                         think_parts.append(t)
                         think_len += len(t)
-                    if content_len - checked_content >= 800 or think_len - checked_think >= 800:
+                    if content_len - checked_content >= 200 or think_len - checked_think >= 200:
                         checked_content, checked_think = content_len, think_len
                         _check_loops("".join(content_parts), "".join(think_parts))
+                        if progress:
+                            try:
+                                progress("".join(content_parts), "".join(think_parts))
+                            except Exception:
+                                pass
                     if (content_len + think_len - cancel_mark >= 200
                             or time.time() - cancel_clock >= 2.0):
                         cancel_mark = content_len + think_len
@@ -289,6 +301,8 @@ def _chat_streaming(payload, model, max_tokens, timeout_s):
                                   "reasoning_content": "".join(think_parts)}}]}
     if usage:
         j["usage"] = usage
+    if timings:
+        j["timings"] = timings
     return j
 
 
@@ -326,11 +340,14 @@ def _chat_once(payload, timeout_s):
     return box["j"]
 
 
-def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0):
+def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0,
+         progress=None):
     """1回のチャット補完を行い、本文テキストを返す。model=None/'auto' ならロード中モデルを使う。
 
     本文または thinking が繰り返しループに入った場合は LoopDetectedError で
     異常終了する（生成中のストリーミング検査＋受信後の検査）。
+    progress があれば、生成中に (本文の途中経過, thinking の途中経過) を逐次通知する
+    （逐次表示・ライブ状態の保存用。呼び出し側で間引くこと）。
     """
     global LAST_THINKING
     if model in (None, "", "auto"):
@@ -341,6 +358,11 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
         _report_usage({"usage": {"prompt_tokens": 1200, "completion_tokens": 800,
                                  "completion_tokens_details": {"reasoning_tokens": 35}},
                         "model": model}, max_tokens)
+        if progress:
+            try:
+                progress(text, LAST_THINKING)
+            except Exception:
+                pass
         return text
     if not base_url():
         raise RuntimeError("推論サーバーのURLが未設定です。Web UI の「設定」画面で接続先（XeStrata）を設定してください。")
@@ -359,13 +381,18 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
     if _cancel_requested():
         raise JobCancelledError("ユーザーにより停止されました")
     try:
-        j = _chat_streaming(payload, model, max_tokens, timeout_s)
+        j = _chat_streaming(payload, model, max_tokens, timeout_s, progress=progress)
     except _StreamUnsupported:
         j = _chat_once(payload, timeout_s)
     _report_usage(j, max_tokens)
     content, think = _split_thinking(j["choices"][0]["message"])
     LAST_THINKING = think
     _check_loops(content, think)
+    if progress:
+        try:
+            progress(content, think)
+        except Exception:
+            pass
     return content
 
 

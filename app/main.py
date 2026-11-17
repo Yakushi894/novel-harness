@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.14"
+APP_VERSION = "1.15"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -93,6 +93,43 @@ def esc(s) -> str:
     return html.escape(str(s or ""), quote=True)
 
 
+def _fmt_tps(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "―"
+    return f"{f:,.0f}" if f >= 100 else f"{f:.1f}"
+
+
+def _sidebar_status() -> str:
+    """サイドバー下部：直近の呼び出しのコンテキスト Fill と処理速度、生成中の逐次状態。"""
+    try:
+        pt = int(db.get_setting("live:prompt_tokens", "") or 0)
+        ct = int(db.get_setting("live:completion_tokens", "") or 0)
+        ctx = pipeline.ctx_window()
+        fill = min(100, round((pt + ct) / ctx * 100)) if ctx and (pt + ct) else 0
+        pre = db.get_setting("live:prefill_tps", "")
+        dec = db.get_setting("live:decode_tps", "")
+        html = (
+            "<div style='margin-top:.6em'>"
+            f"<div>コンテキスト Fill：{fill}%（{(pt + ct):,} / {ctx:,} tok）</div>"
+            f"<div style='background:#333;height:6px;border-radius:3px;margin:.2em 0'>"
+            f"<div style='background:#e8862e;height:6px;border-radius:3px;width:{fill}%'></div></div>"
+            f"<div>GPU プリフィル：{_fmt_tps(pre)} tok/s</div>"
+            f"<div>GPU デコード：{_fmt_tps(dec)} tok/s</div>")
+        import time as _time
+        at = db.get_setting("live:at", "")
+        if at and _time.time() - float(at) < 180 and db.get_setting("live:label", ""):
+            html += (
+                f"<div style='margin-top:.4em;color:#e8b34b'>● 生成中：第{esc(db.get_setting('live:chapter', ''))}章"
+                f"（{esc(db.get_setting('live:label', ''))}）<br>"
+                f"本文 {int(db.get_setting('live:body_chars', '') or 0):,}字 ／ "
+                f"Think {int(db.get_setting('live:think_chars', '') or 0):,}字</div>")
+        return html + "</div>"
+    except Exception:
+        return ""
+
+
 def sidebar(current_id=None, chapters=None) -> str:
     try:
         works = db.q("SELECT * FROM works ORDER BY id DESC")
@@ -123,7 +160,8 @@ def sidebar(current_id=None, chapters=None) -> str:
         + ch_html
         + "<div class='side-foot'>"
         f"<div>ロード中モデル：{esc(llm.loaded_model())}</div>"
-        "<div style='margin-top:.4em'><a href='/glossary'>📖 用語DB</a> ｜ <a href='/settings'>⚙ 設定</a></div>"
+        + _sidebar_status()
+        + "<div style='margin-top:.4em'><a href='/glossary'>📖 用語DB</a> ｜ <a href='/settings'>⚙ 設定</a></div>"
         "</div></div>")
 
 
@@ -776,8 +814,17 @@ def chapter_page(chapter_id: int):
 
     body_html = (f"<pre>{esc(pipeline.read_text(body_art['path']))}</pre>"
                  if body_art else "<p>まだ生成されていません。</p>")
-    think_html = (f"<div class='card'><h2>Think（思考過程）</h2>"
-                  f"<pre>{esc(pipeline.read_text(think['path']))}</pre></div>") if think else ""
+    think_html = (f"<details class='card'><summary>Think（思考過程）</summary>"
+                  f"<pre>{esc(pipeline.read_text(think['path']))}</pre></details>") if think else ""
+    partial_body, partial_think = pipeline.read_partial(w, ch)
+    live_html = ""
+    if partial_body is not None and ch["status"] in ("generating", "revising"):
+        live_think = (f"<details><summary>Think（生成中・逐次）</summary><pre>{esc(partial_think)}</pre></details>"
+                      if partial_think else "")
+        live_html = (f"<div class='card' style='border:2px solid #e8b34b'><h2>生成中（逐次表示）</h2>"
+                     f"<p>本文 {len(partial_body):,}字 ／ Think {len(partial_think or ''):,}字"
+                     "（このページは自動更新されます。ブラウザを閉じても生成は続きます）</p>"
+                     f"<pre>{esc(partial_body)}</pre>{live_think}</div>")
     loop_log_html = (f"<div class='card' style='border:2px solid #b03a3a'><h2>異常終了ログ（生成ループ）</h2>"
                      f"<pre>{esc(pipeline.read_text(loop_log['path']))}</pre></div>") if loop_log else ""
     design_html = (f"<details class='card'><summary>生成指示書</summary>"
@@ -801,6 +848,7 @@ def chapter_page(chapter_id: int):
     <div class='card'><h2>{body_label}</h2>
     <p>文字数：{chars}文字{'（最低' + str(min_chars) + '文字）' if min_chars > 0 else ''} ／ 状態：{esc(ch['status'])}</p>
     {body_html}</div>
+    {live_html}
     {loop_log_html}
     {think_html}
     {design_html}
@@ -812,7 +860,8 @@ def chapter_page(chapter_id: int):
     <p>再生成すると本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
     {job_html}</div>"""
     return page(f"第{ch['number']}章 {ch['title']}", body,
-                current_id=w["id"], chapters=chapters, refresh=active)
+                current_id=w["id"], chapters=chapters,
+                refresh=active or bool(live_html) or ch["status"] in ("generating", "revising"))
 
 
 @app.post("/chapters/{chapter_id}/regen")

@@ -34,6 +34,10 @@ A left sidebar always lists the workspaces and the chapters of the open workspac
 
 If the body or Think output starts repeating while generating, reception stops immediately and the job fails. The looping text is not saved as the body; an incident log with details and a tail excerpt is kept in the artifacts and on the chapter page.
 
+### Live streaming view and sidebar status
+
+Generation runs in the container's worker, so inference and loop detection continue even if you close the browser. While a chapter generates, its page streams the body and Think in progress (Think is collapsible). The sidebar shows the latest call's context fill, GPU prefill/decode speeds (servers reporting timings), and the generating chapter with its counts.
+
 Each chapter also has its own **chapter page** (outline → generated text → **Think** (the model's reasoning, returned as `reasoning_content`) → state → revision notes). Writing **revision notes** on the chapter page and pressing the button regenerates just that chapter with the notes included. For continuation writing, a **state chain** keeps the story state explicit: right after the initial analysis, the harness outputs the source document's end-of-text "current state" (location, character states, relationships, ongoing events, unresolved threads); each chapter takes its start state as input and outputs its end state for the next. Each chapter's input/output state can be inspected on its chapter page.
 
 ### Web search and derivative-work mode
@@ -53,8 +57,8 @@ Only the search terms (words and character names) leave the NAS; **manuscript te
 Editable in the Web UI, applied immediately (no restart):
 
 - Inference server URL and API key (leave the key empty if your LAN setup doesn't need one)
-- **Model Context Window** (live re-allocation of every Max Tokens; defaults use ~90% of the window, with a red over-limit warning)
-- **Context Window (for the second pass)**: a separate budget for the revision pass on a different model (defaults to the maximum, 512k; a changed model gets 80% of it as Max Tokens). When the model does not change, the regular allocation applies
+- **Model Context Window** (live re-allocation of every Max Tokens, with a red over-limit warning)
+- **Context Window (for the second pass)**: a separate budget for the revision pass on a different model (default 512k; a changed model gets 80% of it as Max Tokens). Same model: the regular allocation applies
 - **Max Tokens** per stage (outline / instruction sheet / chapter body / summary / revision)
 - Temperature, revision-model hint, Synology Chat webhook URL
 
@@ -103,7 +107,7 @@ services:
 2. GUI containers: stop the container → "Reset" (recreate from image) → run. Projects: "Build" → "Run".
 3. Your data (works, settings, glossary DB) lives entirely on the volumes (/data and /works), so rebuilding the container never deletes it.
 
-You can also **download / restore a full backup (zip of the DB + generated files)** at the bottom of the Settings page — useful when moving to another host or recreating the volumes from scratch.
+You can also **download / restore a full backup (zip)** at the bottom of the Settings page.
 
 ### 2. Create a work and generate
 
@@ -118,7 +122,7 @@ You can also **download / restore a full backup (zip of the DB + generated files
 
 Place `php/index.php` on a Web Station site and adjust `WORKS_ROOT` at the top to the real path of the works folder. Works with final chapters are listed, and the combined text can be downloaded as .txt from the page.
 
-The output page is a formatted reading page (serif type, paragraph formatting, table of contents, chapter headings, horizontal/vertical writing toggle). Work and chapter titles are read from the harness DB when available (falling back to folder names and chapter numbers). When the PHP page is updated, replace this file on the Web Station.
+The output page is a formatted reading page (serif type, table of contents, horizontal/vertical writing toggle). When the PHP page is updated, replace this file on the Web Station.
 
 ## Layout
 
