@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.28"
+APP_VERSION = "1.29"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -1013,12 +1013,16 @@ def chapter_page(chapter_id: int):
     rev_html = ""
     if rev_art:
         rev_html = f"""
-    <div style='border-top:1px solid #dde1e6;margin-top:1em;padding-top:.6em'><h3>修正概要（ステップ1の結果）</h3>
-    <p>修正概要に入れた文言：{esc(rev_notes) if rev_notes else '（記録なし）'}</p>
+    <div class='card'><h2>修正概要（確認してから本文を再生成）</h2>
+    <div class='row'>使った修正要綱（修正概要に入れた文言）<textarea readonly rows='4'>{esc(rev_notes)}</textarea></div>
     <form method='post' action='/chapters/{ch['id']}/regen_from_rev'>
-    <div class='row'>修正された章概要（この内容で本文を再出力します。直接編集もできます）<textarea name='rev_outline' rows='10'>{esc(pipeline.read_text(rev_art['path']))}</textarea></div>
-    <button>ステップ2：この修正概要で本文を再出力</button></form>
-    <p>押すと修正概要を保存し、生成指示書も作り直してから本文を再出力します（別スレッド実行・Context Window の80%まで使用）。正規の章概要は変わりません。</p></div>"""
+    <div class='row'>修正された章概要（この内容で本文を再生成します。直接編集もできます）<textarea name='rev_outline' rows='10'>{esc(pipeline.read_text(rev_art['path']))}</textarea></div>
+    <button>ステップ2：この修正概要で本文を再生成</button>
+    <button formaction='/chapters/{ch['id']}/apply_rev_outline'>修正概要を章概要（1回目）へ反映</button></form>
+    <form method='post' action='/chapters/{ch['id']}/regen'>
+    <button>章概要（1回目）で本文を再生成</button></form>
+    <p>「ステップ2」は修正概要のまま本文を再生成します（生成指示書も作り直し、別スレッド実行・Context Window の80%まで使用。正規の章概要は変わりません）。<br>
+    「章概要（1回目）へ反映」は修正概要を正規の章概要に昇格させます（本文は変わりません）。反映後に「章概要（1回目）で本文を再生成」を押すと、正規の章概要をもとに生成指示書を作り直して本文を再生成します。</p></div>"""
 
     body = f"""
     <p><a href='/works/{w['id']}'>← 作品ページ「{esc(w['title'])}」に戻る</a></p>
@@ -1043,9 +1047,9 @@ def chapter_page(chapter_id: int):
     <form method='post' action='/chapters/{ch['id']}/revise_outline'>
     <div class='row'>修正要綱（直したい点・盛り込む要素・避ける要素など）<textarea name='notes' rows='5' placeholder='例：灯台守の口調を資料どおり敬語に寄せる。手紙の伏線をもう一度置く。戦闘描写は短く。'></textarea></div>
     <button>ステップ1：修正要綱から修正概要を作成</button></form>
-    <p>まず修正要綱に沿って章概要を作り直した「修正概要」を作成します。内容を確認・編集してよければ、ステップ2で本文を再出力してください。本文の再出力で本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
-    {rev_html}
-    <div id='dyn-jobs'>{job_html}</div></div>"""
+    <p>まず修正要綱に沿って章概要を作り直した「修正概要」を作成します。内容を確認・編集してよければ、ステップ2で本文を再生成してください。本文の再生成で本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
+    <div id='dyn-jobs'>{job_html}</div></div>
+    {rev_html}"""
     live_on = active or bool(live_html) or ch["status"] in ("generating", "revising")
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
@@ -1175,6 +1179,25 @@ def chapter_regen_from_rev(chapter_id: int, rev_outline: str = Form("")):
     notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
     enqueue(ch["work_id"], "regen_chapter",
             {"chapter_id": chapter_id, "notes": notes, "use_rev_outline": True})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/apply_rev_outline")
+def chapter_apply_rev_outline(chapter_id: int, rev_outline: str = Form("")):
+    """修正概要を正規の章概要（1回目）へ反映する。本文は再生成しない。
+
+    編集済みの修正概要を成果物にも保存し直してから、chapters.outline を
+    書き換える。反映後に本文を作り直す場合は「章概要（1回目）で本文を
+    再生成」ボタン（/chapters/{id}/regen）を使う。
+    """
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    w = db.one("SELECT * FROM works WHERE id=?", (ch["work_id"],))
+    if rev_outline.strip():
+        pipeline.save_artifact(w, ch, "rev_outline",
+                               f"ch{ch['number']:03d}_rev_outline.txt", rev_outline)
+        db.run("UPDATE chapters SET outline=? WHERE id=?", (rev_outline, chapter_id))
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 
