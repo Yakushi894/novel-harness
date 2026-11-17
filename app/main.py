@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.23"
+APP_VERSION = "1.24"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -1260,13 +1260,13 @@ def settings_form():
     <div class='card'><h2>モデル / 生成パラメータ</h2>
     <p style='color:#e5484d;font-weight:bold;margin:.3em 0'>※ 値を変更しても、保存を押すまで変更されません（画面の数値はプレビューです）。</p>
     <div id='tokenOverTop' style='color:#e5484d;font-weight:bold'></div>
-    <div class='row'>Context Window（トークン）<select name='ctx_window' onchange='HAlloc()' oninput='HAlloc()'>{ctx_opts}</select> プロンプトに載せる文脈量の目安に使います（実際の上限はサーバー側の最大コンテキストです）。<b>変更すると、その場で下の各 Max Tokens が比率に応じて再配置されます</b>（初期値は合計で約90%を使う配分です。手動調整した値も再配置で上書きされます）</div>
-    <div class='row'>Context Window（2次修正用）<select name='ctx_window_revise' onchange='HRev()' oninput='HRev()'>{ctx_rev_opts}</select><span id='reviseAlloc' style='font-weight:bold'></span> 2次修正はモデルが変わる前提なので、大きめのモデルに合わせて最大にしておくのが既定です。モデル変更時の2次修正では、この値の<b>80%</b>を Max Tokens に自動設定します。モデルが変わらない場合（スレッドモード等）は、通常の Context Window の配分を流用します</div>
+    <div class='row'>Context Window（トークン）<select name='ctx_window' onchange='HAlloc()' oninput='HAlloc()'>{ctx_opts}</select> プロンプトに載せる文脈量の目安に使います（実際の上限はサーバー側の最大コンテキストです）。<b>変更すると、その場で下の各 Max Tokens が比率に応じて再配置されます</b>（各工程は別スレッド実行のため、合計ではなく工程ごとに再配置します。手動調整した値も再配置で上書きされます）</div>
+    <div class='row'>Context Window（2次修正用）<select name='ctx_window_revise' onchange='HRev()' oninput='HRev()'>{ctx_rev_opts}</select><span id='reviseAlloc' style='font-weight:bold'></span> 2次修正はモデルが変わる前提なので、大きめのモデルに合わせて最大にしておくのが既定です。モデル変更時の2次修正では、この値の<b>80%</b>を Max Tokens に自動設定します。モデルが変わらない場合（スレッドモード等）は、通常の Context Window の80%を使います</div>
     {_num_row('Max Tokens：概要生成', 'max_tokens_outline', pipeline.max_tokens('max_tokens_outline', 'MAX_TOKENS_OUTLINE', 16384))}
     {_num_row('Max Tokens：生成指示書・文書解析', 'max_tokens_design', pipeline.max_tokens('max_tokens_design', 'MAX_TOKENS_DESIGN', 8192))}
-    {_num_row('Max Tokens：本文生成（1次出力）', 'max_tokens_chapter', pipeline.max_tokens('max_tokens_chapter', 'MAX_TOKENS_CHAPTER', 32768), '本文生成は別スレッド実行のため、実行時は Context Window の80%を自動使用します（この値は自動配分の初期値です）。思考トークンも内数です')}
+    {_num_row('Max Tokens：本文生成（1次出力）', 'max_tokens_chapter', pipeline.body_max_tokens(), '本文生成は別スレッド実行のため、実行時は Context Window の80%を自動使用します（表示値は実行値です）。思考トークンも内数です')}
     {_num_row('Max Tokens：要約', 'max_tokens_summary', pipeline.max_tokens('max_tokens_summary', 'MAX_TOKENS_SUMMARY', 4096))}
-    {_num_row('Max Tokens：2次修正', 'max_tokens_revise', pipeline.max_tokens('max_tokens_revise', 'MAX_TOKENS_REVISE', 65536), '2次修正も別スレッド実行のため、実行時は対象ウィンドウ（モデル切替時は2次用 Context Window）の80%を自動使用します（この値は表示用です）')}
+    {_num_row('Max Tokens：2次修正', 'max_tokens_revise', pipeline.revise_max_tokens(True), '2次修正も別スレッド実行のため、実行時はモデル切替時はこの値（2次用 Context Window の80%）、同モデル時は通常ウィンドウの80%（' + format(pipeline.revise_max_tokens(False), ',') + '）を自動使用します（表示値は実行値です）')}
     {_num_row('Temperature', 'temperature', pipeline.temperature())}
     {_num_row('思考予算 reasoning_budget_tokens（0＝サーバー任せ）', 'reasoning_budget_tokens', llm.reasoning_budget(), 'thinking の上限の目安です。ジョブ表示のメーター（budget）にも使います')}
     <div class='row'><label><input type='checkbox' name='web_search_enabled' value='1' {'checked' if db.get_setting('web_search_enabled', '1') != '0' else ''}> Web検索を有効にする（用語・キャラクター検索。外部へ送るのは検索語のみ）</label></div>
@@ -1285,22 +1285,24 @@ def settings_form():
         function v(pct, lo) {{ var n = Math.floor(ctx * pct / 256) * 256; return Math.max(lo, n); }}
         return {{
           max_tokens_outline: v(0.10, 1024), max_tokens_design: v(0.05, 1024),
-          max_tokens_chapter: v(0.80, 4096), max_tokens_summary: v(0.05, 512),
-          max_tokens_revise: v(0.25, 4096)
+          max_tokens_chapter: v(0.80, 4096), max_tokens_summary: v(0.05, 512)
         }};
       }}
       function field(n) {{ return document.querySelector('input[name="' + n + '"]'); }}
       function check() {{
         var ctx = ctxSel ? (parseInt(ctxSel.value || '0', 10) || 0) : 0;
-        var sum = 0;
+        var rc = revSel ? (parseInt(revSel.value || '0', 10) || 0) : 0;
+        var over = [];
         names.forEach(function (n) {{
           var el = field(n);
-          sum += parseInt((el && el.value) || '0', 10) || 0;
+          var v = parseInt((el && el.value) || '0', 10) || 0;
+          var win = (n === 'max_tokens_revise') ? rc : ctx;
+          if (win && v > Math.floor(win * 0.8)) over.push(n.replace('max_tokens_', ''));
         }});
         var msg = '';
-        if (ctx && sum > ctx) {{
-          msg = (sum - ctx).toLocaleString() + 'トークンオーバーです（合計 '
-            + sum.toLocaleString() + ' / Context Window ' + ctx.toLocaleString() + '）';
+        if (over.length) {{
+          msg = 'ウィンドウの80%を超えている項目があります（' + over.join('、')
+            + '）。各工程は別スレッド実行のため合計は無関係で、実行時は80%で頭打ちになります';
         }}
         ['tokenOver', 'tokenOverTop'].forEach(function (id) {{
           var w = document.getElementById(id);
@@ -1310,15 +1312,18 @@ def settings_form():
       function applyCtx() {{
         if (!ctxSel) return;
         var a = alloc(parseInt(ctxSel.value || '0', 10) || 0);
-        names.forEach(function (n) {{ var el = field(n); if (el) el.value = a[n]; }});
+        Object.keys(a).forEach(function (n) {{ var el = field(n); if (el) el.value = a[n]; }});
         check();
       }}
       function revNote() {{
         var el = document.getElementById('reviseAlloc');
-        if (!el || !revSel) return;
+        if (!revSel) return;
         var rc = parseInt(revSel.value || '0', 10) || 0;
         var v = Math.max(4096, Math.floor(rc * 0.8 / 256) * 256);
-        el.textContent = rc ? ' → モデル変更時の2次修正 Max Tokens: ' + v.toLocaleString() + '（この値の80%）' : '';
+        if (el) el.textContent = rc ? ' → モデル変更時の2次修正 Max Tokens: ' + v.toLocaleString() + '（この値の80%）' : '';
+        var f = field('max_tokens_revise');
+        if (f && rc) f.value = v;
+        check();
       }}
       if (ctxSel) {{
         ctxSel.addEventListener('change', applyCtx);
@@ -1386,7 +1391,8 @@ def settings_save(strata_base_url: str = Form(""), strata_api_key: str = Form(""
         max_tokens_design = str(alloc["max_tokens_design"])
         max_tokens_chapter = str(alloc["max_tokens_chapter"])
         max_tokens_summary = str(alloc["max_tokens_summary"])
-        max_tokens_revise = str(alloc["max_tokens_revise"])
+        # max_tokens_revise は2次用ウィンドウの80%が実行値で、表示も実行値から
+        # 描画するため、通常ウィンドウの再配置では上書きしない。
     for key, val in (("ctx_window", ctx_window), ("ctx_window_revise", ctx_window_revise),
                      ("max_tokens_outline", max_tokens_outline),
                      ("max_tokens_design", max_tokens_design), ("max_tokens_chapter", max_tokens_chapter),

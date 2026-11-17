@@ -56,7 +56,7 @@ Only the search terms (words and character names) leave the NAS; **manuscript te
 Editable in the Web UI, applied immediately (no restart):
 
 - Inference server URL and API key (leave the key empty if your LAN setup doesn't need one)
-- **Model Context Window** (live re-allocation of every Max Tokens, with a red over-limit warning)
+- **Model Context Window** (live re-allocation of every Max Tokens, with a red warning above 80% of the window)
 - **Context Window (for the second pass)**: a separate budget for the revision pass on a different model (default 512k). The revision always uses 80% of the applicable window as Max Tokens (same model: 80% of the regular window)
 - **Max Tokens** per stage (outline / instruction sheet / chapter body / summary / revision)
 - Temperature, revision-model hint, Synology Chat webhook URL
