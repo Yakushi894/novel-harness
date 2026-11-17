@@ -124,6 +124,19 @@ def revise_hint():
     return v if v else ENV_REVISE_HINT
 
 
+def design_max_tokens():
+    """生成指示書・文書解析の実行時 max_tokens。
+
+    打ち切り防止（設定 design_no_truncate、既定ON）が有効なら、別スレッドの
+    上限いっぱい（Context Window の90%）を使う。サーバー（Strata）側が
+    プロンプト分を差し引いて自動調整するため大きく渡しても安全で、
+    解析・指示書が途中で切れなくなる。無効なら保存済みの設定値を使う。
+    """
+    if db.get_setting("design_no_truncate", "1") != "0":
+        return max(4096, (int(ctx_window() * 0.9) // 256) * 256)
+    return max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192)
+
+
 def ctx_budget_chars(ctx=None):
     """プロンプトに載せる文脈（設定資料＋素材）の上限。1トークン≒1字で概算。"""
     return max(6000, min(240000, (ctx or ctx_window()) // 2))
@@ -514,13 +527,13 @@ def do_analyze(job, work):
     result = llm.chat(
         "auto", prompts.ANALYSIS_SYSTEM + sys_note(work),
         prompts.ANALYSIS_USER.format(text=text),
-        max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
+        max_tokens=design_max_tokens(),
         temperature=temperature())
     save_artifact(work, None, "analysis", "analysis.txt", result)
     state = llm.chat(
         "auto", prompts.STATE_EXTRACT_SYSTEM + sys_note(work),
         prompts.STATE_EXTRACT_USER.format(analysis=result, text=text),
-        max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
+        max_tokens=design_max_tokens(),
         temperature=temperature())
     save_artifact(work, None, "state", "state_initial.txt", state)
     set_stage(work["id"], "analyzed")
@@ -749,7 +762,7 @@ def design_prompt(work, chapter, intent, use_tail=True):
             summaries=summaries_text(work, chapter["number"]),
             prev_tail=prev_tail(work, chapter["number"]) if use_tail else "",
             source="", intent=intent),
-        max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
+        max_tokens=design_max_tokens(),
         temperature=temperature())
     save_artifact(work, chapter, "prompt", f"ch{chapter['number']:03d}.txt", text)
     return text
