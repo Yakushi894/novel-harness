@@ -485,6 +485,8 @@ def do_outline(job, work):
     found = re.findall(r"第(\d+)章[ 　]*(.*?)\n(.*?)(?=第\d+章|\Z)", text, re.S)
     if not found:
         raise RuntimeError("概要のパースに失敗しました")
+    if (work.get("mode") or "switch") == "single":
+        found = [(1, found[0][1], found[0][2])]  # 単章モードは最初の1章だけに絞る
     db.run("DELETE FROM chapters WHERE work_id=?", (work["id"],))
     for num, title, body in found:
         db.run("INSERT INTO chapters(work_id, number, title, outline, status) VALUES(?,?,?,?,'outlined')",

@@ -305,3 +305,10 @@ Synology Container Manager 上の docker-compose で単一コンテナとして�
 - **Think の折り畳み表示**：章ページの Think は最後に一括表示する形から `<details>` の折り畳みに変更（生成中の Think も折り畳み内で逐次表示）。
 - **左サイドバーの状態表示**：直近の呼び出しについて、コンテキスト Fill（(prompt+completion)／Context Window のバー＋%）、GPU プリフィル／デコード速度（llama.cpp 系サーバーが返す `timings` の prompt_per_second／predicted_per_second。返さないサーバーでは ―）、生成中は「第N章（工程）本文 X字／Think Y字」を表示。usage 受信時に `live:*` 設定へ保存する。
 - 検証：偽ストリーミングサーバー（usage＋timings 付き）＋実アプリ通しで、生成中に章ページの逐次カードとサイドバーの生成中表示・Fill を確認。完了後は Fill 3%（8,000／262,144 tok）、プリフィル 1,234 tok/s・デコード 42.5 tok/s の表示、Think の details 化、部分ファイル消去を確認。モック回帰（全章20,731字以上）も確認。
+
+## 34. v1.16 更新（2026-11-17）
+
+- **単章モード**（ユーザー要望、AnythingLLM 風の対話形）：モードに `single` を追加。作成時・作品情報のどちらでも選べ、章数は1に固定される（概要生成側でも、モデルが複数章を返した場合は最初の1章だけに絞る）。
+- 作品ページに専用パネルを追加：本文（final／draft）と Think（折り畳み）、生成中は逐次表示をその場で表示し、下部の「指示」欄＋ボタンで次を進める。`POST /works/{id}/single_act` が状態に応じて工程を自動選択する（章なし→概要生成、概要のみ→生成＋仕上げ（generate_thread）、本文あり→指示つき再生成（regen_chapter、notes を payload に））。生成中は何もしない。
+- 工程ボタンはスレッドモードと同じ組（生成＋仕上げ／仕上げ修正のみ）を流用し、モデル切替は行わない。
+- 検証：モック実アプリ通しで、作成（章数5指定→1に固定）→ single_act で概要（1章のみ）→ single_act で generate_thread（章 final）→ 指示つき single_act で regen_chapter（notes 伝達）までを確認。パネルの表示とモード表示も確認。

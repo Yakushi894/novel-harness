@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.15"
+APP_VERSION = "1.16"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -318,7 +318,8 @@ def index():
     （届かない場合は自動で続きを書き足します）</div>
     <div class='row'>モード：
     <label><input type='radio' name='mode' value='switch' checked> 切替モード（1次出力→モデル切替→2次修正）</label><br>
-    <label><input type='radio' name='mode' value='thread'> スレッドモード（モデル切替なし・章ごとに別スレッドで完結）</label></div>
+    <label><input type='radio' name='mode' value='thread'> スレッドモード（モデル切替なし・章ごとに別スレッドで完結）</label><br>
+    <label><input type='radio' name='mode' value='single'> 単章モード（1章完結・指示を出しながら対話的に詰める）</label></div>
     <div class='row'><label><input type='checkbox' name='claude_ok' value='1'> Muse監修レーン可</label></div>
     <button>作成</button></form></div>"""
     steps = "<p class='steps'>工程：" + " ⇒ ".join(FLOW_STEPS) + "</p>"
@@ -331,11 +332,13 @@ async def create_work(title: str = Form(...), request: str = Form(""), settings:
                       min_chars: int = Form(0), source_file: UploadFile = File(None)):
     base = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower() or "work"
     slug = f"{base}-{int(time.time()) % 1000000}"
+    if mode == "single":
+        num_chapters = 1
     wid = db.run(
         "INSERT INTO works(title, slug, request, settings, num_chapters, claude_ok, mode, min_chars, created_at, updated_at)"
         " VALUES(?,?,?,?,?,?,?,?,?,?)",
         (title, slug, request, settings, num_chapters, claude_ok,
-         mode if mode in ("switch", "thread") else "switch",
+         mode if mode in ("switch", "thread", "single") else "switch",
          min_chars if min_chars in MIN_CHARS_CHOICES else 0, db.now(), db.now()))
     pipeline.work_dir(slug)
     if source_file is not None and source_file.filename:
@@ -536,6 +539,36 @@ def work_detail(work_id: int):
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_thread'><button>3〜4. 章ごとスレッドで生成＋仕上げ（モデル切替なし・最初に選んだモデルのまま完結）</button></form>"
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 仕上げ修正のみ（生成済みの章を同モデルで修正）</button></form>")
 
+    single_html = ""
+    if (w.get("mode") or "switch") == "single":
+        sch = chapters[0] if chapters else None
+        if sch is None:
+            single_inner = ("<p>まだ章がありません。まず「2. 次章の内容（各章概要）を生成」を押してください。"
+                            "概要ができたら、下の指示欄から生成を始められます。</p>")
+        else:
+            s_final = pipeline.latest_artifact(w["id"], sch["id"], "final")
+            s_draft = pipeline.latest_artifact(w["id"], sch["id"], "draft")
+            s_body_art = s_final or s_draft
+            s_think = pipeline.latest_artifact(w["id"], sch["id"], "think")
+            sp_body, sp_think = pipeline.read_partial(w, sch)
+            if sp_body is not None and sch["status"] in ("generating", "revising"):
+                single_inner = (f"<p>生成中（逐次表示）：本文 {len(sp_body):,}字 ／ Think {len(sp_think or ''):,}字</p>"
+                                f"<pre>{esc(sp_body)}</pre>")
+            elif s_body_art:
+                single_inner = f"<pre>{esc(pipeline.read_text(s_body_art['path']))}</pre>"
+                if s_think:
+                    single_inner += (f"<details><summary>Think（思考過程）</summary>"
+                                     f"<pre>{esc(pipeline.read_text(s_think['path']))}</pre></details>")
+            else:
+                single_inner = "<p>本文はまだありません。下の指示欄から生成を始められます。</p>"
+        single_html = f"""
+    <div class='card'><h2>単章モード（対話的に詰める）</h2>
+    {single_inner}
+    <form method='post' action='/works/{w['id']}/single_act'>
+    <div class='row'>指示（生成の方向性／直したい点。空欄でも可）<textarea name='notes' rows='3'></textarea></div>
+    <button>指示して生成／再生成</button></form>
+    <p>章がない場合は概要生成、概要だけの場合は生成＋仕上げ、本文がある場合は指示を含めて再生成します。</p></div>"""
+
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
     notice_html = ""
     if notices:
@@ -594,10 +627,11 @@ def work_detail(work_id: int):
     {search_html}
     {notice_html}
     <div class='card'><h2>工程の実行</h2>
-    <p>モード：<b>{'スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）'}</b>（作品情報で変更できます）</p>
+    <p>モード：<b>{'単章モード（1章完結・対話的に詰める）' if (w.get('mode') or 'switch') == 'single' else ('スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）')}</b>（作品情報で変更できます）</p>
     {ws_html}
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='outline'><button>2. 次章の内容（各章概要）を生成</button></form>
-    {thread_buttons if (w.get('mode') or 'switch') == 'thread' else switch_buttons}
+    {thread_buttons if (w.get('mode') or 'switch') in ('thread', 'single') else switch_buttons}
+    {single_html}
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p></div>
     <h2>章と概要</h2>{ch_html or '<p>まだ概要がありません。</p>'}
     <div class='card'><h2>ジョブ</h2>{job_html or '<p>なし</p>'}</div>
@@ -610,7 +644,8 @@ def work_detail(work_id: int):
     <div class='row'>章の最低文字数<select name='min_chars'>{min_chars_options(w.get('min_chars'))}</select>（届かない場合は自動で続きを書き足します）</div>
     <div class='row'>モード：
     <label><input type='radio' name='mode' value='switch' {'checked' if (w.get('mode') or 'switch') == 'switch' else ''}> 切替モード</label>
-    <label><input type='radio' name='mode' value='thread' {'checked' if (w.get('mode') or 'switch') == 'thread' else ''}> スレッドモード（切替なし）</label></div>
+    <label><input type='radio' name='mode' value='thread' {'checked' if (w.get('mode') or 'switch') == 'thread' else ''}> スレッドモード（切替なし）</label>
+    <label><input type='radio' name='mode' value='single' {'checked' if (w.get('mode') or 'switch') == 'single' else ''}> 単章モード（1章完結）</label></div>
     <button>保存</button></form></div>
     <div class='card'><h2>ワークスペースの削除</h2>
     <form method='post' action='/works/{w['id']}/delete' onsubmit="return confirm('このワークスペースを削除しますか？（作品データが消えます。用語DBは残ります）')">
@@ -735,8 +770,8 @@ def artifact_delete(artifact_id: int):
 def work_meta(work_id: int, request: str = Form(""), settings: str = Form(""),
               num_chapters: int = Form(3), mode: str = Form("switch"), min_chars: int = Form(0)):
     db.run("UPDATE works SET request=?, settings=?, num_chapters=?, mode=?, min_chars=?, updated_at=? WHERE id=?",
-           (request, settings, num_chapters,
-            mode if mode in ("switch", "thread") else "switch",
+           (request, settings, 1 if mode == "single" else num_chapters,
+            mode if mode in ("switch", "thread", "single") else "switch",
             min_chars if min_chars in MIN_CHARS_CHOICES else 0, db.now(), work_id))
     return RedirectResponse(f"/works/{work_id}", status_code=303)
 
@@ -862,6 +897,23 @@ def chapter_page(chapter_id: int):
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
                 refresh=active or bool(live_html) or ch["status"] in ("generating", "revising"))
+
+
+@app.post("/works/{work_id}/single_act")
+def work_single_act(work_id: int, notes: str = Form("")):
+    """単章モードの指示フォーム：状態に応じて次の工程を自動で選ぶ。"""
+    chs = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work_id,))
+    if not chs:
+        enqueue(work_id, "outline")
+    else:
+        ch = chs[0]
+        if ch["status"] in ("outlined", "pending"):
+            enqueue(work_id, "generate_thread")
+        elif ch["status"] in ("generating", "revising"):
+            pass  # 生成中は何もしない
+        else:
+            enqueue(work_id, "regen_chapter", {"chapter_id": ch["id"], "notes": notes})
+    return RedirectResponse(f"/works/{work_id}", status_code=303)
 
 
 @app.post("/chapters/{chapter_id}/regen")
