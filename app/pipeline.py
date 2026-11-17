@@ -219,13 +219,41 @@ def progress_writer(work, ch, label, base_body=""):
     return write
 
 
+def _save_backup(work, chapter, target_kind, text):
+    """本文の前版を backups へ退避する（kind='backup'、章ごとに種別10件まで保持）。"""
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ms = int((time.time() % 1) * 1000)
+    fname = f"ch{chapter['number']:03d}_{target_kind}_{ts}-{ms:03d}.txt"
+    save_artifact(work, chapter, "backup", fname, text)
+    rows = db.q("SELECT * FROM artifacts WHERE work_id=? AND chapter_id=? AND kind='backup' "
+                "ORDER BY id DESC", (work["id"], chapter["id"]))
+    same = [r for r in rows if f"_{target_kind}_" in os.path.basename(r["path"])]
+    for r in same[10:]:
+        try:
+            os.remove(r["path"])
+        except OSError:
+            pass
+        db.run("DELETE FROM artifacts WHERE id=?", (r["id"],))
+
+
 def save_artifact(work, chapter, kind, filename, text):
     d = work_dir(work["slug"])
     sub = {"source": "source", "analysis": "source", "glossary": "source", "character": "source",
            "prompt": "prompts", "draft": "drafts", "state": "states", "think": "thinking",
            "summary": "summaries", "revised": "revised", "final": "final", "log": "logs",
-           "plan": "plans", "rev_outline": "plans"}[kind]
+           "plan": "plans", "rev_outline": "plans", "backup": "backups",
+           "check": "checks"}[kind]
     path = os.path.join(d, sub, filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 本文（draft/final/revised）を上書きする前に、前版を自動で残す
+    if kind in ("draft", "final", "revised") and chapter is not None and os.path.isfile(path):
+        try:
+            old = read_text(path)
+        except OSError:
+            old = None
+        if old is not None and old != text:
+            _save_backup(work, chapter, kind, old)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     db.run(
@@ -715,6 +743,112 @@ def _expand_one_plan(work, ch, chapters):
         save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
         raise RuntimeError(f"第{ch['number']}章の展開計画のパースに失敗しました（モデルの生出力を成果物のログに保存しました）")
     _save_plan(work, ch, sections)
+
+
+def _edit_distance_le1(a, b):
+    """編集距離が1以下なら True（表記ゆれ候補の検出用）。"""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(1 for x, y in zip(a, b) if x != y) == 1
+    if len(a) > len(b):
+        a, b = b, a
+    i = j = diff = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            j += 1
+            diff += 1
+            if diff > 1:
+                return False
+    return True
+
+
+def do_final_check(job, work):
+    """最終チェック：全章横断のプログラム検査＋モデルによる矛盾チェック。
+
+    結果は成果物 kind='check'（final_check.txt）に保存する。
+    """
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work["id"],))
+    bodies = {}
+    for ch in chapters:
+        art = (latest_artifact(work["id"], ch["id"], "final")
+               or latest_artifact(work["id"], ch["id"], "draft"))
+        if art:
+            bodies[ch["number"]] = (ch, read_text(art["path"]), art["kind"])
+    if not bodies:
+        raise RuntimeError("チェックする本文がまだありません（先に本文を生成してください）。")
+    lines = [f"最終チェック：{work['title']}", ""]
+    counts = {n: len(t) for n, (_c, t, _k) in bodies.items()}
+    avg = sum(counts.values()) / len(counts)
+    lines.append("■ 章別文字数")
+    for ch in chapters:
+        n = ch["number"]
+        if n in counts:
+            mark = ""
+            if counts[n] < avg * 0.6:
+                mark = "（平均より大幅に少ない）"
+            elif counts[n] > avg * 1.5:
+                mark = "（平均より大幅に多い）"
+            lines.append(f"第{n}章 {ch['title']}：{counts[n]:,}字{mark}（{bodies[n][2]}）")
+        else:
+            lines.append(f"第{n}章 {ch['title']}：本文なし（未生成）")
+    # 複数の章に繰り返し現れるフレーズ（項目行は除く）
+    seg_chapters = {}
+    for n, (_c, t, _k) in bodies.items():
+        segs = {s.strip() for s in re.split(r"[。！？\n「」『』]", t)
+                if len(s.strip()) >= 12 and not llm._is_property_line(s.strip())}
+        for s in segs:
+            seg_chapters.setdefault(s, set()).add(n)
+    repeated = sorted(((s, ns) for s, ns in seg_chapters.items() if len(ns) >= 3),
+                      key=lambda x: -len(x[1]))[:10]
+    lines.append("")
+    lines.append("■ 複数の章に繰り返し現れるフレーズ（決め台詞の使いすぎ候補）")
+    if repeated:
+        for s, ns in repeated:
+            lines.append(f"・「{s}」― {len(ns)}章に出現（第{'、'.join(str(x) for x in sorted(ns))}章）")
+    else:
+        lines.append("・目立つ繰り返しはありませんでした。")
+    # 登場チェック：状態シートの見出し名と用語DBの語が本文に出ているか＋表記ゆれ候補
+    names = set()
+    state_art = db.one("SELECT * FROM artifacts WHERE work_id=? AND kind='state' "
+                       "ORDER BY id DESC LIMIT 1", (work["id"],))
+    state_text = read_text(state_art["path"]) if state_art else ""
+    names |= set(re.findall(r"【([^】]{1,20})】", state_text))
+    for g in db.q("SELECT term FROM glossary"):
+        names.add(g["term"])
+    if names:
+        all_text = "\n".join(t for _c, t, _k in bodies.values())
+        missing = [nm for nm in sorted(names) if all_text.count(nm) == 0]
+        lines.append("")
+        lines.append("■ 登場チェック（設定・状態・用語DBの名前）")
+        if missing:
+            for nm in missing:
+                lines.append(f"・{nm}：本文に一度も登場しません")
+        else:
+            lines.append("・全ての名前が本文に登場しています。")
+        ordered = sorted(nm for nm in names if len(nm) >= 2)
+        pairs = [(a, b) for i, a in enumerate(ordered) for b in ordered[i + 1:]
+                 if _edit_distance_le1(a, b)]
+        if pairs:
+            lines.append("■ 表記ゆれ候補（よく似た名前のペア）")
+            for a, b in pairs[:10]:
+                lines.append(f"・{a} ／ {b}")
+    # モデルによる矛盾チェック
+    check_text = llm.chat(
+        "auto", prompts.FINAL_CHECK_SYSTEM + sys_note(work),
+        prompts.FINAL_CHECK_USER.format(
+            settings=settings_text(work),
+            summaries=summaries_text(work, 10 ** 9) or "（要約なし）",
+            state=state_text or "（状態シートなし）"),
+        max_tokens=design_max_tokens(), temperature=temperature())
+    lines.append("")
+    lines.append("■ 設定・あらすじとの矛盾チェック（モデル）")
+    lines.append(check_text)
+    save_artifact(work, None, "check", "final_check.txt", "\n".join(lines))
+    add_notice(work, "最終チェックが完了しました。成果物の check（final_check.txt）を確認してください。")
 
 
 def do_expand_plan_one(job, work):
@@ -1212,6 +1346,12 @@ def do_regen_chapter(job, work):
             for a in db.q("SELECT * FROM artifacts WHERE work_id=? AND chapter_id=? AND kind=?",
                           (work["id"], ch["id"], kind)):
                 try:
+                    old = read_text(a["path"])
+                    if old:
+                        _save_backup(work, ch, kind, old)
+                except OSError:
+                    pass
+                try:
                     os.remove(a["path"])
                 except OSError:
                     pass
@@ -1325,7 +1465,7 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "search_term": do_search_term, "term_check": do_term_check,
             "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
             "expand_plans": do_expand_plans, "regen_plan": do_regen_plan,
-            "expand_plan_one": do_expand_plan_one,
+            "expand_plan_one": do_expand_plan_one, "final_check": do_final_check,
             "revise_outline": do_revise_outline, "outline_chapter": do_outline_chapter}
 
 
@@ -1433,6 +1573,16 @@ def recover_stale_jobs():
                         (w["id"],))
         if not active:
             set_stage(w["id"], "failed")
+    # 生成中・修正中のまま残った章も、成果物の有無に応じた状態へ戻す
+    for ch in db.q("SELECT * FROM chapters WHERE status IN ('generating','revising')"):
+        if db.one("SELECT id FROM jobs WHERE work_id=? AND status IN ('queued','running') LIMIT 1",
+                  (ch["work_id"],)):
+            continue
+        has_final = db.one("SELECT id FROM artifacts WHERE work_id=? AND chapter_id=? AND kind='final' LIMIT 1",
+                           (ch["work_id"], ch["id"]))
+        has_draft = db.one("SELECT id FROM artifacts WHERE work_id=? AND chapter_id=? AND kind='draft' LIMIT 1",
+                           (ch["work_id"], ch["id"]))
+        set_chapter_status(ch["id"], "final" if has_final else ("generated" if has_draft else "outlined"))
 
 
 def start_worker():

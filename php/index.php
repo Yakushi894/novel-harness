@@ -39,9 +39,9 @@ function db_meta(string $slug): array {
     return $meta;
 }
 
-/** final の章ファイルを [章番号 => パス] で返す。 */
-function chapter_files(string $dir): array {
-    $files = glob($dir . '/final/ch*.txt') ?: [];
+/** 指定サブフォルダ（final / drafts）の章ファイルを [章番号 => パス] で返す。 */
+function chapter_files(string $dir, string $sub = 'final'): array {
+    $files = glob($dir . '/' . $sub . '/ch*.txt') ?: [];
     sort($files, SORT_STRING);
     $out = [];
     foreach ($files as $f) {
@@ -57,6 +57,11 @@ function list_works(): array {
     $works = [];
     foreach (glob(WORKS_ROOT . '/*', GLOB_ONLYDIR) ?: [] as $dir) {
         $chapters = chapter_files($dir);
+        $isDraft = false;
+        if (!$chapters) {
+            $chapters = chapter_files($dir, 'drafts');
+            $isDraft = $chapters !== [];
+        }
         if ($chapters) {
             $slug = basename($dir);
             $meta = db_meta($slug);
@@ -65,6 +70,7 @@ function list_works(): array {
                 'dir' => $dir,
                 'title' => $meta['title'] ?? (preg_replace('/-\d+$/', '', $slug) ?: $slug),
                 'chapters' => count($chapters),
+                'draft' => $isDraft,
             ];
         }
     }
@@ -77,9 +83,9 @@ function chapter_heading(int $num, array $meta): string {
 }
 
 /** .txt ダウンロード用の結合テキスト。 */
-function combined_text(string $dir, array $meta, string $title): string {
+function combined_text(array $files, array $meta, string $title): string {
     $out = [$title, ''];
-    foreach (chapter_files($dir) as $num => $f) {
+    foreach ($files as $num => $f) {
         $out[] = chapter_heading($num, $meta);
         $out[] = '';
         $out[] = trim((string)file_get_contents($f));
@@ -113,30 +119,9 @@ function paragraphs_html(string $text): string {
     return $html;
 }
 
-$slug = preg_replace('/[^a-zA-Z0-9\-_]/', '', (string)($_GET['work'] ?? ''));
-$dir = $slug !== '' ? WORKS_ROOT . '/' . $slug : null;
-if ($dir !== null && !is_dir($dir)) {
-    $dir = null;
-}
-
-$meta = $dir !== null ? db_meta($slug) : ['title' => null, 'chapters' => []];
-$title = $meta['title'] ?? (preg_replace('/-\d+$/', '', $slug) ?: $slug);
-
-if ($dir !== null && isset($_GET['download'])) {
-    $text = combined_text($dir, $meta, $title);
-    header('Content-Type: text/plain; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . $slug . '.txt"');
-    echo $text;
-    exit;
-}
-?>
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?= $dir !== null ? e($title) . '｜' : '' ?>小説ハーネス出力</title>
-<style>
+/** 共通スタイル（画面表示と整形HTMLダウンロードで同じデザインを使う）。 */
+function page_style(): string {
+    return <<<'CSS'
   :root { --ink:#26241f; --paper:#faf7f0; --accent:#7a4a21; --muted:#8a8378; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--paper); color:var(--ink);
@@ -179,7 +164,75 @@ if ($dir !== null && isset($_GET['download'])) {
     body { background:#fff; }
     #novel.vertical { writing-mode:horizontal-tb; height:auto; overflow:visible; }
   }
-</style>
+CSS;
+}
+
+/** 本文中身（目次＋各章）のHTML。画面とダウンロードで共用する。 */
+function book_body_html(array $files, array $meta): string {
+    $toc = '<nav class="toc" id="toc"><h2>目次</h2><ol>';
+    foreach ($files as $num => $f) {
+        $toc .= '<li><a href="#ch' . $num . '">' . e(chapter_heading($num, $meta)) . '</a></li>';
+    }
+    $toc .= '</ol></nav>';
+    $sections = '';
+    foreach ($files as $num => $f) {
+        $sections .= '<section id="ch' . $num . '"><h2 class="chapter">'
+            . e(chapter_heading($num, $meta)) . '</h2>'
+            . paragraphs_html((string)file_get_contents($f))
+            . '<div class="totoc"><a href="#toc">目次へ戻る ↑</a></div></section>' . "\n";
+    }
+    return $toc . '<article id="novel">' . $sections . '<div class="fin">― 了 ―</div></article>';
+}
+
+/** 整形HTMLファイルとしてダウンロードさせる単体ドキュメント（同じデザイン）。 */
+function standalone_html(array $files, array $meta, string $title, bool $isDraft): string {
+    $sub = '全' . count($files) . '章' . ($isDraft ? '（下書き・1次出力）' : '');
+    return '<!DOCTYPE html>' . "\n" . '<html lang="ja"><head><meta charset="utf-8">'
+        . '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        . '<title>' . e($title) . '</title><style>' . page_style() . '</style></head><body>'
+        . '<div class="wrap"><header class="book"><h1>' . e($title) . '</h1>'
+        . '<div class="sub">' . e($sub) . '</div></header>'
+        . book_body_html($files, $meta)
+        . '</div></body></html>';
+}
+
+$slug = preg_replace('/[^a-zA-Z0-9\-_]/', '', (string)($_GET['work'] ?? ''));
+$dir = $slug !== '' ? WORKS_ROOT . '/' . $slug : null;
+if ($dir !== null && !is_dir($dir)) {
+    $dir = null;
+}
+
+$meta = $dir !== null ? db_meta($slug) : ['title' => null, 'chapters' => []];
+$title = $meta['title'] ?? (preg_replace('/-\d+$/', '', $slug) ?: $slug);
+
+$files = $dir !== null ? chapter_files($dir) : [];
+$isDraft = false;
+if ($dir !== null && !$files) {
+    $files = chapter_files($dir, 'drafts');
+    $isDraft = $files !== [];
+}
+
+if ($dir !== null && isset($_GET['download'])) {
+    if ($_GET['download'] === 'html') {
+        header('Content-Type: text/html; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $slug . '.html"');
+        echo standalone_html($files, $meta, $title, $isDraft);
+        exit;
+    }
+    $text = combined_text($files, $meta, $title);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $slug . '.txt"');
+    echo $text;
+    exit;
+}
+?>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><?= $dir !== null ? e($title) . '｜' : '' ?>小説ハーネス出力</title>
+<style><?= page_style() ?></style>
 </head>
 <body>
 <div class="wrap">
@@ -189,41 +242,24 @@ if ($dir !== null && isset($_GET['download'])) {
   <?php foreach (list_works() as $w): ?>
     <li>
       <span><a class="wt" href="?work=<?= e($w['slug']) ?>"><?= e($w['title']) ?></a>
-      <span class="wc">（全<?= $w['chapters'] ?>章）</span></span>
-      <span><a href="?work=<?= e($w['slug']) ?>&download=1">.txt でダウンロード</a></span>
+      <span class="wc">（全<?= $w['chapters'] ?>章<?= $w['draft'] ? '・下書き' : '' ?>）</span></span>
+      <span><a href="?work=<?= e($w['slug']) ?>&download=1">.txt</a> ／ <a href="?work=<?= e($w['slug']) ?>&download=html">整形HTML</a></span>
     </li>
   <?php endforeach; ?>
   </ul>
   <?php if (!list_works()): ?><p>完成した作品はまだありません。</p><?php endif; ?>
 <?php else: ?>
-  <?php $files = chapter_files($dir); ?>
   <header class="book">
     <h1><?= e($title) ?></h1>
-    <div class="sub">全<?= count($files) ?>章</div>
+    <div class="sub">全<?= count($files) ?>章<?= $isDraft ? '（下書き・1次出力）' : '' ?></div>
     <div class="toolbar">
       <a href="?">← 作品一覧</a>
       <a href="?work=<?= e($slug) ?>&download=1">.txt でダウンロード</a>
+      <a href="?work=<?= e($slug) ?>&download=html">整形HTMLでダウンロード</a>
       <button type="button" id="vToggle">縦書きで読む</button>
     </div>
   </header>
-  <nav class="toc" id="toc">
-    <h2>目次</h2>
-    <ol>
-    <?php foreach ($files as $num => $f): ?>
-      <li><a href="#ch<?= $num ?>"><?= e(chapter_heading($num, $meta)) ?></a></li>
-    <?php endforeach; ?>
-    </ol>
-  </nav>
-  <article id="novel">
-  <?php foreach ($files as $num => $f): ?>
-    <section id="ch<?= $num ?>">
-      <h2 class="chapter"><?= e(chapter_heading($num, $meta)) ?></h2>
-      <?= paragraphs_html((string)file_get_contents($f)) ?>
-      <div class="totoc"><a href="#toc">目次へ戻る ↑</a></div>
-    </section>
-  <?php endforeach; ?>
-    <div class="fin">― 了 ―</div>
-  </article>
+  <?= book_body_html($files, $meta) ?>
   <script>
     document.getElementById('vToggle').addEventListener('click', function () {
       var on = document.getElementById('novel').classList.toggle('vertical');

@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.33"
+APP_VERSION = "1.34"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -803,6 +803,7 @@ def work_detail(work_id: int):
     badge_rev = _badge((bool(_all_ch) and _all_ch <= _final_ch) or "revise_all" in _job_done)
     badge_thread = _badge((bool(_all_ch) and _all_ch <= _final_ch) or "generate_thread" in _job_done)
     badge_rev_thread = _badge("revise_all" in _job_done)
+    badge_check = _badge("final_check" in _job_done or any(a["kind"] == "check" for a in arts))
 
     switch_buttons = (
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_chapters'><button>3. 1次出力（本文生成・現在ロード中のモデル）</button>{badge_gen}</form>"
@@ -871,7 +872,8 @@ def work_detail(work_id: int):
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='expand_plans'><button>2.5 各章を展開（詳細概要・開始/終了状態・内容詳細を章ごとに連鎖生成）</button>{badge_expand}</form>
     {thread_buttons if (w.get('mode') or 'switch') in ('thread', 'single') else switch_buttons}
     {single_html}
-    <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p></div>
+    <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p>
+    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='final_check'><button>6. 最終チェック（全章横断：文字数・繰り返し・登場・矛盾）</button>{badge_check}</form></div>
     <h2>章と概要</h2>{ch_html or '<p>まだ概要がありません。</p>'}
     <div class='card'><h2>ジョブ</h2><div id='dyn-jobs'>{job_html}</div></div>
     <div class='card'><h2>成果物</h2>{art_html or '<p>なし</p>'}</div>
@@ -1004,6 +1006,33 @@ def artifact_delete(artifact_id: int):
         db.run("DELETE FROM artifacts WHERE id=?", (artifact_id,))
         return RedirectResponse(f"/works/{a['work_id']}", status_code=303)
     return RedirectResponse("/", status_code=303)
+
+
+@app.post("/artifacts/{artifact_id}/restore")
+def artifact_restore(artifact_id: int):
+    """前版バックアップ（kind='backup'）を本文（draft/final）へ復元する。
+
+    復元先の現在の本文も save_artifact 側で自動バックアップされるため、
+    復元自体も取り消せる。
+    """
+    a = db.one("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
+    if not a or a["kind"] != "backup" or not a["chapter_id"]:
+        return RedirectResponse("/", status_code=303)
+    m = re.match(r"ch(\d+)_(draft|final)_", os.path.basename(a["path"]))
+    if not m:
+        return RedirectResponse(f"/artifacts/{artifact_id}", status_code=303)
+    target = m.group(2)
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (a["chapter_id"],))
+    w = db.one("SELECT * FROM works WHERE id=?", (a["work_id"],))
+    if not ch or not w:
+        return RedirectResponse("/", status_code=303)
+    pipeline.save_artifact(w, ch, target, f"ch{ch['number']:03d}.txt",
+                           pipeline.read_text(a["path"]))
+    if target == "final":
+        db.run("UPDATE chapters SET status='final' WHERE id=?", (ch["id"],))
+    elif not pipeline.latest_artifact(w["id"], ch["id"], "final"):
+        db.run("UPDATE chapters SET status='generated' WHERE id=?", (ch["id"],))
+    return RedirectResponse(f"/chapters/{ch['id']}", status_code=303)
 
 
 @app.post("/works/{work_id}/meta")
@@ -1382,9 +1411,17 @@ def artifact_view(artifact_id: int):
     if not a:
         return PlainTextResponse("not found", status_code=404)
     # 削除は2段構え：一覧には削除ボタンを置かず、この表示ページでのみ削除できる
+    restore_btn = ""
+    if a["kind"] == "backup" and re.match(r"ch\d+_(draft|final)_", os.path.basename(a["path"])):
+        target = "2次修正（final）" if "_final_" in os.path.basename(a["path"]) else "1次出力（draft）"
+        restore_btn = (
+            f"<form method='post' action='/artifacts/{a['id']}/restore' style='display:inline' "
+            f"onsubmit=\"return confirm('この前版を{target}へ復元しますか？（現在の本文も前版として残ります）')\">"
+            f"<button>この版を{target}へ復元</button></form> ")
     head = (
         f"<div class='card'><b>{esc(a['kind'])} #{a['id']}</b>　作成：{_fmt_ts(a['created_at'])}"
         f"　{esc(a['path'])} "
+        f"{restore_btn}"
         f"<form method='post' action='/artifacts/{a['id']}/delete' style='display:inline' "
         f"onsubmit=\"return confirm('この成果物を削除しますか？')\">"
         f"<button>この成果物を削除</button></form></div>")
@@ -1630,6 +1667,10 @@ def backup_download():
 @app.post("/restore")
 async def restore_upload(file: UploadFile = File(...)):
     """バックアップ zip からデータを復元する（DB 置き換え＋ファイル書き戻し）。"""
+    if db.one("SELECT id FROM jobs WHERE status IN ('queued','running') LIMIT 1"):
+        return PlainTextResponse(
+            "実行中・待機中のジョブがあるため復元できません。ジョブの完了後に実行してください。",
+            status_code=400)
     raw = await file.read()
     buf = io.BytesIO(raw)
     if not zipfile.is_zipfile(buf):
