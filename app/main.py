@@ -17,13 +17,14 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 import db
+from datetime import datetime, timedelta, timezone
 import llm
 import pipeline
 
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.26"
+APP_VERSION = "1.27"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -76,6 +77,7 @@ body{font-family:'Segoe UI',sans-serif;margin:0;line-height:1.6;background:#f4f5
 .meter{background:#e8ebef;border-radius:6px;height:10px;margin:.3em 0;overflow:hidden}
 .meter>div{background:#2e6fdb;height:100%}
 .usage{font-size:.9em;color:#444}
+.muted{color:#777;font-size:.88em}
 .side-foot{margin-top:1.5em;padding:.6em .4em;border-top:1px solid #2a2e36;font-size:.85em;color:#9aa3af}
 .main{flex:1;padding:1.2em 1.6em;max-width:1000px}
 textarea{width:100%} input[type=text]{width:100%}
@@ -716,14 +718,11 @@ def work_detail(work_id: int):
     art_html = "".join(
         f"<div><a href='/artifacts/{a['id']}'>"
         + ("log（異常終了ログ）" if a["kind"] == "log" else esc(a["kind"]))
-        + f"</a> {esc(a['path'])}"
-        + (f" <form method='post' action='/artifacts/{a['id']}/delete' style='display:inline'><button>削除</button></form>"
-           if a["kind"] in ("glossary", "character", "analysis", "source") else "") + "</div>"
+        + f"</a> {esc(a['path'])} <span class='muted'>作成：{_fmt_ts(a['created_at'])}</span></div>"
         for a in arts)
     source_html = "".join(
         f"<div>📄 <a href='/artifacts/{a['id']}'>{esc(os.path.basename(a['path']))}</a>"
-        f" <form method='post' action='/artifacts/{a['id']}/delete' style='display:inline' "
-        f"onsubmit=\"return confirm('このファイルを削除しますか？')\"><button>削除</button></form></div>"
+        f" <span class='muted'>作成：{_fmt_ts(a['created_at'])}</span></div>"
         for a in arts if a["kind"] == "source")
     if source_html:
         source_html = "<p>アップロード済みファイル：</p>" + source_html
@@ -1199,12 +1198,27 @@ def chapter_save(chapter_id: int, title: str = Form(""), outline: str = Form("")
     return RedirectResponse(f"/works/{row['work_id']}" if row else "/", status_code=303)
 
 
+def _fmt_ts(ts):
+    """成果物の作成時刻（epoch秒）を日本時間の 'YYYY-MM-DD HH:MM' で返す。"""
+    try:
+        return datetime.fromtimestamp(float(ts), timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
 @app.get("/artifacts/{artifact_id}")
 def artifact_view(artifact_id: int):
     a = db.one("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
     if not a:
         return PlainTextResponse("not found", status_code=404)
-    return page(f"{a['kind']} #{a['id']}", f"<pre>{esc(pipeline.read_text(a['path']))}</pre>")
+    # 削除は2段構え：一覧には削除ボタンを置かず、この表示ページでのみ削除できる
+    head = (
+        f"<div class='card'><b>{esc(a['kind'])} #{a['id']}</b>　作成：{_fmt_ts(a['created_at'])}"
+        f"　{esc(a['path'])} "
+        f"<form method='post' action='/artifacts/{a['id']}/delete' style='display:inline' "
+        f"onsubmit=\"return confirm('この成果物を削除しますか？')\">"
+        f"<button>この成果物を削除</button></form></div>")
+    return page(f"{a['kind']} #{a['id']}", head + f"<pre>{esc(pipeline.read_text(a['path']))}</pre>")
 
 
 @app.get("/works/{work_id}/download")
