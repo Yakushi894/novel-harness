@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.38"
+APP_VERSION = "1.39"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -99,6 +99,24 @@ form.act span{display:block;margin-top:.3em;color:#444;font-size:.92em;line-heig
 summary{cursor:pointer;font-weight:600}
 .steps{color:#555}
 h1{margin-top:.2em}
+@media (max-width:820px){
+  .layout{flex-direction:column;min-height:auto}
+  .sidebar{width:100%;flex:none;position:static;height:auto;overflow:visible;padding:.7em .8em}
+  .brand{padding-bottom:.3em}
+  .side-sec{margin:.6em .4em .2em}
+  .ws-item{display:inline-block;margin:.15em .2em;background:#23262d}
+  .ws-item.active{background:#2e6fdb}
+  .ch-item{padding-left:.6em}
+  .side-foot{margin-top:.8em}
+  .main{padding:.8em .7em;max-width:100%}
+  .card{padding:.8em .8em;margin:.7em 0}
+  h1{font-size:1.45em}
+  h2{font-size:1.2em}
+  input,textarea,select{font-size:16px}
+  button{max-width:100%}
+  pre{padding:.7em;font-size:.92em}
+  .steps{font-size:.9em}
+}
 """
 
 

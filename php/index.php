@@ -159,6 +159,16 @@ function page_style(): string {
   #novel.vertical section { margin:0 0 0 3em; }
   #novel.vertical h2.chapter { border-bottom:none; border-left:2px solid var(--accent);
     padding:0 0 0 .6em; margin:0 0 0 1.4em; }
+  @media (max-width:600px) {
+    .wrap { padding:1.2em .95em 3em; }
+    header.book { margin-bottom:1.6em; }
+    header.book h1 { font-size:1.35em; }
+    nav.toc { padding:.8em 1em; margin-bottom:1.8em; }
+    article section { margin-bottom:2.4em; }
+    article h2.chapter { font-size:1.15em; margin-bottom:1.1em; }
+    article p { font-size:1em; line-height:1.95; }
+    ul.works li { flex-direction:column; align-items:flex-start; gap:.4em; }
+  }
   @media print {
     .toolbar, nav.toc, .totoc { display:none; }
     body { background:#fff; }
