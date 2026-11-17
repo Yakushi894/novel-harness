@@ -181,11 +181,14 @@ def reasoning_budget():
         return 0
 
 
-def _report_usage(j, max_tokens):
+def _report_usage(j, max_tokens, req_chars=0):
     """API応答の usage を取り出して USAGE_SINK に渡す。
 
     thinking（reasoning）トークンは、サーバーが usage に内訳を含めて返す場合だけ分かる。
     返らないサーバーでは reasoning_tokens=None になり、表示側は出力トークン総数で代替する。
+    ストリーミング応答に usage / timings が含まれないサーバー（XeStrata 等）では、
+    サイドバーの Fill・速度が永遠に更新されなくなるため、リクエスト文字数と
+    受信チャンク数から推定して埋める（rec["estimated"]=True で区別する）。
     """
     if not USAGE_SINK:
         return
@@ -194,14 +197,39 @@ def _report_usage(j, max_tokens):
     rt = details.get("reasoning_tokens", u.get("reasoning_tokens"))
     # llama.cpp 系サーバーが返す処理速度（プリフィル／デコード）。無いサーバーでは None。
     tm = j.get("timings") or {}
+    pt, ct = u.get("prompt_tokens"), u.get("completion_tokens")
+    pre = tm.get("prompt_per_second") if isinstance(tm.get("prompt_per_second"), (int, float)) else None
+    dec = tm.get("predicted_per_second") if isinstance(tm.get("predicted_per_second"), (int, float)) else None
+    estimated = False
+    stream = j.get("_stream") or {}
+    if not isinstance(pt, int) and req_chars:
+        pt = round(req_chars / 1.5)  # 日本語は概ね 1.5字/トークンで推定
+        estimated = True
+    if not isinstance(ct, int):
+        if stream.get("chunks"):
+            ct = int(stream["chunks"])  # 1チャンク≒1トークンとして数える
+            estimated = True
+        else:
+            try:
+                msg = j["choices"][0]["message"]
+                out_chars = len(msg.get("content") or "") + len(msg.get("reasoning_content") or "")
+            except Exception:
+                out_chars = 0
+            if out_chars:
+                ct = round(out_chars / 1.5)
+                estimated = True
+    if dec is None and stream.get("seconds") and isinstance(ct, int) and stream["seconds"] > 1:
+        dec = ct / stream["seconds"]
+        estimated = True
     rec = {
-        "prompt_tokens": u.get("prompt_tokens"),
-        "completion_tokens": u.get("completion_tokens"),
+        "prompt_tokens": pt if isinstance(pt, int) else None,
+        "completion_tokens": ct if isinstance(ct, int) else None,
         "reasoning_tokens": rt if isinstance(rt, int) else None,
-        "prefill_tps": tm.get("prompt_per_second") if isinstance(tm.get("prompt_per_second"), (int, float)) else None,
-        "decode_tps": tm.get("predicted_per_second") if isinstance(tm.get("predicted_per_second"), (int, float)) else None,
+        "prefill_tps": pre,
+        "decode_tps": dec,
         "max_tokens": max_tokens,
         "model": j.get("model"),
+        "estimated": estimated,
     }
     try:
         USAGE_SINK(rec)
@@ -261,6 +289,7 @@ def _chat_streaming(payload, model, max_tokens, timeout_s, progress=None):
     usage = None
     timings = None
     chunks = 0
+    started = time.time()
     try:
         with httpx.Client(timeout=timeout_s) as client:
             with client.stream("POST", f"{base_url()}/v1/chat/completions",
@@ -328,6 +357,7 @@ def _chat_streaming(payload, model, max_tokens, timeout_s, progress=None):
         j["usage"] = usage
     if timings:
         j["timings"] = timings
+    j["_stream"] = {"chunks": chunks, "seconds": time.time() - started}
     return j
 
 
@@ -420,7 +450,7 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
         j = _chat_streaming(payload, model, max_tokens, timeout_s, progress=progress)
     except _StreamUnsupported:
         j = _chat_once(payload, timeout_s)
-    _report_usage(j, max_tokens)
+    _report_usage(j, max_tokens, req_chars=len(system or "") + len(user or ""))
     content, think = _split_thinking(j["choices"][0]["message"])
     LAST_THINKING = think
     _check_loops(content, think)

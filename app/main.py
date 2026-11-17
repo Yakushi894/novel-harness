@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.32"
+APP_VERSION = "1.33"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -86,6 +86,9 @@ textarea{width:100%} input[type=text]{width:100%}
 pre{white-space:pre-wrap;background:#f7f7f7;padding:1em;border-radius:8px}
 button{padding:.45em 1.1em;border:1px solid #2e6fdb;background:#2e6fdb;color:#fff;border-radius:8px;cursor:pointer}
 button:hover{background:#255cb8}
+form.act{margin-top:.9em}
+form.act button{padding:.32em .95em}
+form.act span{display:block;margin-top:.3em;color:#444;font-size:.92em;line-height:1.55}
 .row{margin:.5em 0}
 summary{cursor:pointer;font-weight:600}
 .steps{color:#555}
@@ -129,6 +132,14 @@ def _sidebar_status() -> str:
                 f"（{esc(db.get_setting('live:label', ''))}）<br>"
                 f"本文 {int(db.get_setting('live:body_chars', '') or 0):,}字 ／ "
                 f"Think {int(db.get_setting('live:think_chars', '') or 0):,}字</div>")
+        call_at = db.get_setting("live:call_at", "")
+        if call_at:
+            try:
+                age = max(0, int(_time.time() - float(call_at)))
+                html += (f"<div class='muted'>最終更新：{age}秒前</div>" if age < 120
+                         else f"<div class='muted'>最終更新：{age // 60}分前</div>")
+            except ValueError:
+                pass
         return html + "</div>"
     except Exception:
         return ""
@@ -510,6 +521,90 @@ def _jobs_html(w, jobs) -> str:
     return rows or "<p>なし</p>"
 
 
+JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成",
+              "expand_plans": "各章を展開", "expand_plan_one": "展開計画の生成（この章のみ）",
+              "regen_plan": "展開計画の再生成", "generate_chapters": "本文生成（1次出力）",
+              "generate_thread": "章ごとスレッド生成", "revise_all": "2次修正",
+              "regen_chapter": "本文の再生成", "revise_outline": "修正概要の作成",
+              "outline_chapter": "概要の再生成", "search_term": "キャラクター検索",
+              "term_check": "用語チェック", "final_check": "最終チェック"}
+
+
+def _peek_text(work, ch):
+    """止まった場所のちら見せ用テキスト（生成途中→異常終了ログ→保存済み本文の順）。"""
+    if ch is None:
+        return "", ""
+    body, _t = pipeline.read_partial(work, ch)
+    if body:
+        return "生成途中の本文（末尾）", body
+    log = pipeline.latest_artifact(work["id"], ch["id"], "log")
+    if log:
+        return "異常終了時の出力（末尾）", pipeline.read_text(log["path"])
+    art = (pipeline.latest_artifact(work["id"], ch["id"], "final")
+           or pipeline.latest_artifact(work["id"], ch["id"], "draft"))
+    if art:
+        return "保存済みの本文（末尾）", pipeline.read_text(art["path"])
+    return "", ""
+
+
+def _current_work_html(w) -> str:
+    """「現在の作業」パネル：実行中／停止した工程と、本文の途中経過をちら見せする。"""
+    jobs = db.q("SELECT * FROM jobs WHERE work_id=? ORDER BY id DESC LIMIT 5", (w["id"],))
+    if not jobs:
+        return "<p>まだ工程は実行されていません。</p>"
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=?", (w["id"],))
+
+    def job_chapter(j):
+        try:
+            payload = json.loads(j.get("payload") or "{}")
+        except ValueError:
+            payload = {}
+        cid = payload.get("chapter_id")
+        if cid:
+            return next((c for c in chapters if c["id"] == cid), None)
+        if db.get_setting("live:work_id", "") == str(w["id"]):
+            num = db.get_setting("live:chapter", "")
+            if num.isdigit():
+                return next((c for c in chapters if c["number"] == int(num)), None)
+        return None
+
+    def peek_html(j, ch):
+        label, text = _peek_text(w, ch)
+        if not text:
+            return ""
+        tail = text[-1200:]
+        note = "（末尾1,200字を表示）" if len(text) > 1200 else ""
+        return (f"<p style='margin:.6em 0 .3em'>{esc(label)}{note}</p>"
+                f"<pre style='max-height:15em;overflow:auto'>{esc(tail)}</pre>")
+
+    active = next((j for j in jobs if j["status"] in ("queued", "running")), None)
+    j = active or jobs[0]
+    ch = job_chapter(j)
+    label = JOB_LABELS.get(j["kind"], j["kind"])
+    ch_note = f"第{ch['number']}章" if ch else ""
+    if active:
+        if active["status"] == "queued":
+            head = f"<p>待機中：{esc(label)}{('（' + ch_note + '）') if ch_note else ''} の開始待ちです。</p>"
+        else:
+            dur = fmt_dur(time.time() - j["created_at"])
+            live_label = db.get_setting("live:label", "") if db.get_setting("live:work_id", "") == str(w["id"]) else ""
+            head = (f"<p><b style='color:#b97d1a'>● 作業中</b>：{esc(label)}"
+                    f"{('（' + ch_note + ('・' + esc(live_label) if live_label else '') + '）') if ch_note else ''}"
+                    f" ― 開始から {dur}</p>")
+        return head + peek_html(j, ch)
+    if j["status"] == "done":
+        return f"<p>待機中です。直近の工程「{esc(label)}」は完了しています。</p>"
+    if j["status"] == "cancelled":
+        head = (f"<p><b style='color:#b03a3a'>■ 停止中</b>：{esc(label)}"
+                f"{('（' + ch_note + '）') if ch_note else ''} は停止ボタンで中断されました。"
+                "止まった場所は下の本文で確認できます。</p>")
+        return head + peek_html(j, ch)
+    head = (f"<p><b style='color:#b03a3a'>■ 停止中</b>：{esc(label)}"
+            f"{('（' + ch_note + '）') if ch_note else ''} でエラーが発生しました。"
+            f"<br><span class='muted'>{esc((j['error'] or '')[:200])}</span></p>")
+    return head + peek_html(j, ch)
+
+
 def _work_head_html(w) -> str:
     """作品ページ冒頭の状態・モデル表示フラグメント。"""
     draft_model = db.get_setting(f"work:{w['id']}:draft_model", "")
@@ -768,6 +863,7 @@ def work_detail(work_id: int):
     {state_html}
     {search_html}
     {notice_html}
+    <div class='card'><h2>現在の作業</h2><div id='dyn-current'>{_current_work_html(w)}</div></div>
     <div class='card'><h2>工程の実行</h2>
     <p>モード：<b>{'単章モード（1章完結・対話的に詰める）' if (w.get('mode') or 'switch') == 'single' else ('スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）')}</b>（作品情報で変更できます）</p>
     {ws_html}
@@ -1047,7 +1143,7 @@ def chapter_page(chapter_id: int):
     <div class='row'>修正された章概要（この内容で本文を再生成します。直接編集もできます）<textarea name='rev_outline' rows='10'>{esc(pipeline.read_text(rev_art['path']))}</textarea></div>
     <button>ステップ2：この修正概要で本文を再生成</button>
     <button formaction='/chapters/{ch['id']}/apply_rev_outline'>修正概要を章概要（1回目）へ反映</button></form>
-    <form method='post' action='/chapters/{ch['id']}/regen'>
+    <form method='post' action='/chapters/{ch['id']}/regen' class='act'>
     <button>章概要（1回目）で本文を再生成</button></form>
     <p>「ステップ2」は修正概要のまま本文を再生成します（生成指示書も作り直し、別スレッド実行・Context Window の80%まで使用。正規の章概要は変わりません）。<br>
     「章概要（1回目）へ反映」は修正概要を正規の章概要に昇格させます（本文は変わりません）。反映後に「章概要（1回目）で本文を再生成」を押すと、正規の章概要をもとに生成指示書を作り直して本文を再生成します。</p></div>"""
@@ -1059,17 +1155,17 @@ def chapter_page(chapter_id: int):
     <div class='row'>タイトル<input type='text' name='title' value="{esc(ch['title'])}"></div>
     <div class='row'>概要<textarea name='outline' rows='5'>{esc(ch['outline'])}</textarea></div>
     <button>概要を保存（承認）</button></form>
-    <form method='post' action='/chapters/{ch['id']}/outline_regen'>
+    <form method='post' action='/chapters/{ch['id']}/outline_regen' class='act'>
     <button>この章の概要だけ再生成</button>
     <span>概要が途中で切れてしまった場合などに、この章の概要だけを作り直して上書きします（本文は変わりません）。</span></form>
-    <form method='post' action='/chapters/{ch['id']}/expand_plan'>
+    <form method='post' action='/chapters/{ch['id']}/expand_plan' class='act'>
     <button>この章の展開計画のみ生成</button>
     <span>この章のみ、細概要・開始/終了状態・内容詳細（展開計画）を作ります（全章一括の「2.5 各章を展開」と同じ内容を1章だけ）。</span></form>
-    <form method='post' action='/chapters/{ch['id']}/regen'>
+    <form method='post' action='/chapters/{ch['id']}/regen' class='act'>
     <input type='hidden' name='with_state' value='0'>
     <button>本文のみ（再）生成</button>
     <span>本文だけを作り直します。終了状態・要約は今のまま保持します（状態チェーンは変わりません）。</span></form>
-    <form method='post' action='/chapters/{ch['id']}/regen'>
+    <form method='post' action='/chapters/{ch['id']}/regen' class='act'>
     <button>本文＋状態（再）生成</button>
     <span>本文に合わせて終了状態（状態チェーン）と要約も作り直します（従来の再生成）。</span></form></div>
     {status_line}
@@ -1108,6 +1204,7 @@ def work_live(work_id: int):
         "dyn-head": _work_head_html(w),
         "dyn-jobs": _jobs_html(w, jobs),
         "dyn-side": _sidebar_status(),
+        "dyn-current": _current_work_html(w),
     }
     if (w.get("mode") or "switch") == "single":
         regions["dyn-single"] = _single_gen_html(w, chapters[0] if chapters else None)
