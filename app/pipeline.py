@@ -308,7 +308,29 @@ def update_state(work, ch, body, prev_state):
         max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
         temperature=temperature())
     save_artifact(work, ch, "state", f"ch{ch['number']:03d}_state.txt", new_state)
+    _sync_plan_from_body(work, ch, new_state)
     return new_state
+
+
+def _sync_plan_from_body(work, ch, actual_state):
+    """生成した本文から作った実績の終了状態を、展開計画側にも同期する。
+
+    当該章の計画の「章終了時の状態」「次章開始状態」を実績で置き換え、
+    次章の計画の「章開始時の状態」も実績に合わせる。本文で計画外に
+    追加された内容の帰結も、状態として計画に反映される。
+    """
+    sections = get_plan(work, ch)
+    if sections:
+        sections["章終了時の状態"] = actual_state
+        sections["次章開始状態"] = actual_state
+        save_artifact(work, ch, "plan", f"ch{ch['number']:03d}_plan.txt", plan_to_text(sections))
+    nxt = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?",
+                 (work["id"], ch["number"] + 1))
+    if nxt:
+        nsec = get_plan(work, nxt)
+        if nsec:
+            nsec["章開始時の状態"] = actual_state
+            save_artifact(work, nxt, "plan", f"ch{nxt['number']:03d}_plan.txt", plan_to_text(nsec))
 
 
 def save_think(work, ch):
@@ -549,7 +571,7 @@ def do_outline(job, work):
 
 
 # ---------- 章の展開計画（全体章概要の後に章ごとに展開する） ----------
-PLAN_SECTIONS = ["詳細概要", "章開始時の状態", "章内容詳細", "章終了時の状態", "次章開始状態", "終了状態"]
+PLAN_SECTIONS = ["詳細概要", "章開始時の状態", "章終了時の目標状態", "章内容詳細", "章終了時の状態", "次章開始状態", "終了状態"]
 
 
 def parse_plan(text):
