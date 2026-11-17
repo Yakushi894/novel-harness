@@ -102,7 +102,7 @@ def tail_chars():
 
 def work_dir(slug):
     d = os.path.join(WORKS_DIR, slug)
-    for sub in ("source", "prompts", "drafts", "summaries", "revised", "final", "states", "thinking", "logs", "live"):
+    for sub in ("source", "prompts", "drafts", "summaries", "revised", "final", "states", "thinking", "logs", "live", "plans"):
         os.makedirs(os.path.join(d, sub), exist_ok=True)
     return d
 
@@ -175,7 +175,8 @@ def save_artifact(work, chapter, kind, filename, text):
     d = work_dir(work["slug"])
     sub = {"source": "source", "analysis": "source", "glossary": "source", "character": "source",
            "prompt": "prompts", "draft": "drafts", "state": "states", "think": "thinking",
-           "summary": "summaries", "revised": "revised", "final": "final", "log": "logs"}[kind]
+           "summary": "summaries", "revised": "revised", "final": "final", "log": "logs",
+           "plan": "plans"}[kind]
     path = os.path.join(d, sub, filename)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -495,6 +496,139 @@ def do_outline(job, work):
     notify(f"【小説ハーネス】「{work['title']}」の各章概要（次章の内容）ができました。確認と修正をお願いします。")
 
 
+# ---------- 章の展開計画（全体章概要の後に章ごとに展開する） ----------
+PLAN_SECTIONS = ["詳細概要", "章開始時の状態", "章内容詳細", "章終了時の状態", "次章開始状態", "終了状態"]
+
+
+def parse_plan(text):
+    sections = {}
+    for p in re.split(r"^##\s*", text or "", flags=re.M):
+        if not p.strip():
+            continue
+        head, _, body = p.partition("\n")
+        head = head.strip()
+        if head in PLAN_SECTIONS:
+            sections[head] = body.strip()
+    return sections
+
+
+def plan_to_text(sections):
+    return "\n\n".join(f"## {name}\n{sections[name]}"
+                       for name in PLAN_SECTIONS if sections.get(name))
+
+
+def get_plan(work, ch):
+    a = latest_artifact(work["id"], ch["id"], "plan")
+    return parse_plan(read_text(a["path"])) if a else None
+
+
+def plan_start_state(work, ch, chapters):
+    """展開時の章開始状態：前章の計画の「次章開始状態」を最優先で引き継ぐ。"""
+    if ch["number"] > 1:
+        prev = next((c for c in chapters if c["number"] == ch["number"] - 1), None)
+        if prev:
+            pp = get_plan(work, prev)
+            if pp and pp.get("次章開始状態"):
+                return pp["次章開始状態"]
+    return current_state(work, ch["number"]) or "物語の開始時点。キャラクタは初期状態にある。"
+
+
+def _save_plan(work, ch, sections):
+    save_artifact(work, ch, "plan", f"ch{ch['number']:03d}_plan.txt", plan_to_text(sections))
+    if sections.get("章終了時の状態"):
+        # 状態チェーンにも流し、本文生成の開始状態として使えるようにする
+        save_artifact(work, ch, "state", f"ch{ch['number']:03d}_state.txt",
+                      sections["章終了時の状態"])
+
+
+def _final_note(work, ch, chapters):
+    return ("この章は物語の最終章です。「終了状態」の見出しも付けてください。"
+            if ch["number"] == max(c["number"] for c in chapters) else
+            "この章は最終章ではありません。「終了状態」の見出しは付けないでください。")
+
+
+def do_expand_plans(job, work):
+    """各章の展開：詳細概要・開始状態・内容詳細・終了状態・次章開始状態（最終章は終了状態）を章ごとに連鎖生成する。
+
+    payload.from_number があれば、その章以降だけを再生成する（カスケード用）。
+    開始状態は前章の「次章開始状態」を引き継ぐため、必ず章順に処理する。
+    """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    from_number = int(payload.get("from_number") or 1)
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work["id"],))
+    if not chapters:
+        raise RuntimeError("先に各章概要を生成してください")
+    for ch in chapters:
+        if ch["number"] < from_number:
+            continue
+        if _cancelled(job):
+            return
+        text = llm.chat(
+            "auto", prompts.PLAN_EXPAND_SYSTEM + sys_note(work),
+            prompts.PLAN_EXPAND_USER.format(
+                settings=settings_text(work), outlines=outlines_text(work),
+                number=ch["number"], title=ch["title"], outline=ch["outline"],
+                start_state=plan_start_state(work, ch, chapters),
+                final_note=_final_note(work, ch, chapters), notes_block=""),
+            max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
+            temperature=temperature())
+        sections = parse_plan(text)
+        if not sections.get("章内容詳細") or not sections.get("章終了時の状態"):
+            raise RuntimeError(f"第{ch['number']}章の展開計画のパースに失敗しました")
+        _save_plan(work, ch, sections)
+    if payload.get("cascade"):
+        db.set_setting(f"plan_pending:{work['id']}", "")
+    set_stage(work["id"], "plans_ready")
+    add_notice(work, "各章の展開計画を作成しました。章ごとに確認し、追加指定があれば当該章を再生成してください。")
+
+
+def do_regen_plan(job, work):
+    """追加指定による当該章の計画再生成：詳細概要と開始状態は固定し、内容詳細以降を作り直す。
+
+    完了後は plan_pending に章番号を残し、作品ページで「OKなら次章以降を再生成」
+    （カスケード）を押せるようにする。
+    """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (payload["chapter_id"],))
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work["id"],))
+    sections = get_plan(work, ch)
+    if not sections:
+        raise RuntimeError("先に「各章を展開」を実行してください")
+    notes = (payload.get("notes") or "").strip()
+    text = llm.chat(
+        "auto", prompts.PLAN_REGEN_SYSTEM + sys_note(work),
+        prompts.PLAN_REGEN_USER.format(
+            settings=settings_text(work),
+            number=ch["number"], title=ch["title"],
+            detail=sections.get("詳細概要", ""),
+            start_state=sections.get("章開始時の状態", ""),
+            notes=notes or "（追加指定なし：内容詳細以降を練り直す）",
+            final_note=_final_note(work, ch, chapters)),
+        max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
+        temperature=temperature())
+    new = parse_plan(text)
+    if not new.get("章内容詳細") or not new.get("章終了時の状態"):
+        raise RuntimeError("再生成した計画のパースに失敗しました")
+    for k in ("章内容詳細", "章終了時の状態", "次章開始状態", "終了状態"):
+        if new.get(k):
+            sections[k] = new[k]
+    _save_plan(work, ch, sections)
+    db.set_setting(f"plan_pending:{work['id']}", str(ch["number"]))
+    add_notice(work, f"第{ch['number']}章の展開計画を再生成しました。内容がOKなら「第{ch['number'] + 1}章以降を再生成」を押してください（開始状態が変わるため次章以降の計画が古くなっています）。")
+
+
+def plan_instruction(work, ch):
+    """本文生成の指示書へ差し込む展開計画テキスト（計画があれば）。"""
+    sections = get_plan(work, ch)
+    return ("\n\n【章の展開計画】\n" + plan_to_text(sections)) if sections else ""
+
+
 def design_prompt(work, chapter, intent, use_tail=True):
     text = llm.chat(
         "auto", prompts.PROMPT_DESIGN_SYSTEM + sys_note(work),
@@ -526,7 +660,7 @@ def do_generate_chapters(job, work):
         set_chapter_status(ch["id"], "generating")
         pw = progress_writer(work, ch, "1次出力")
         try:
-            instruction = design_prompt(work, ch, work["request"])
+            instruction = design_prompt(work, ch, work["request"]) + plan_instruction(work, ch)
             used_model = llm.current_model()
             prev_state = current_state(work, ch["number"])
             body = llm.chat(
@@ -639,7 +773,7 @@ def do_generate_thread(job, work):
             set_chapter_status(ch["id"], "generating")
             pw = progress_writer(work, ch, "生成")
             try:
-                instruction = design_prompt(work, ch, work["request"], use_tail=False)
+                instruction = design_prompt(work, ch, work["request"], use_tail=False) + plan_instruction(work, ch)
                 used_model = llm.current_model()
                 prev_state = current_state(work, ch["number"])
                 body = llm.chat(
@@ -884,7 +1018,7 @@ def do_regen_chapter(job, work):
     set_chapter_status(ch["id"], "generating")
     design = latest_artifact(work["id"], ch["id"], "prompt")
     base_instruction = read_text(design["path"]) if design else ""
-    instruction = base_instruction
+    instruction = base_instruction + plan_instruction(work, ch)
     if notes:
         instruction = (instruction + f"\n\n【修正要綱】\n{notes}").strip()
     prev_state = current_state(work, ch["number"])
@@ -940,7 +1074,8 @@ def do_regen_chapter(job, work):
 HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "generate_chapters": do_generate_chapters, "revise_all": do_revise_all,
             "search_term": do_search_term, "term_check": do_term_check,
-            "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter}
+            "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
+            "expand_plans": do_expand_plans, "regen_plan": do_regen_plan}
 
 
 def _cancelled(job):

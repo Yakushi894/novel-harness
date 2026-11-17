@@ -15,8 +15,8 @@ A controller container that runs novel generation **entirely on your local netwo
 Workspaces are **per story**: one workspace per story/document; a new story gets its own workspace. Each workspace follows a fixed pipeline:
 
 1. **Load source**: Enter the concept and settings, or upload an existing text file (e.g. .txt) as source material for a continuation. Uploaded documents can be run through **initial document analysis**: the model extracts a foundation brief (premise, characters, plot so far, style and viewpoint, open threads) that is then included in every later generation step.
-2. **Next-chapter content**: Generate all chapter outlines in one pass, then edit and approve them in the Web UI.
-3. **First pass (draft)**: Before writing each chapter, a *prompt-design layer* produces a chapter-specific instruction sheet (style and viewpoint consistency, how to pick up the previous flow, elements to include or avoid), and the chapter is written from it. Each finished chapter is summarized and the summary is fed into the next chapter's context (summary chaining).
+2. **Next-chapter content**: Generate all chapter outlines in one pass, then edit and approve them in the Web UI. An "expand chapters" step then chains per chapter: detailed outline, start/end states, detailed content, and next chapter's start state (plus an ending state for the final chapter). Extra instructions regenerate that chapter onward, and once approved, the following chapters can be regenerated too.
+3. **First pass (draft)**: Before writing each chapter, a *prompt-design layer* produces a chapter-specific instruction sheet (style/viewpoint consistency, elements to include or avoid), and the chapter is written from it. Each finished chapter is summarized for the next chapter's context (summary chaining).
 4. **Second pass (revision)**: Once all chapters exist, the container posts "please switch the model" to Synology Chat. When the model on the inference server changes, the container detects it via `/v1/models` and starts the revision automatically. **The wait has no timeout** — if the notification is missed overnight, the generated drafts stay put and work resumes when the switch happens (with re-notifications).
    - The second pass is a **proofreading** pass: it must not change the meaning, content, or plot. It only fixes particles and grammar, typos, unnatural Japanese, and stray Chinese/English (converted to Japanese) — except a foreign character's own lines.
    - **Thread mode (no switching)** is also available per work: with the model chosen at the start, each chapter runs in its own thread (independent context) from draft to finishing revision. Each thread receives the uploaded TXT and the chapter outlines, but not other chapters' body text, which keeps the context short.
@@ -37,19 +37,17 @@ If the body or Think output starts repeating while generating, reception stops i
 
 ### Live streaming view and sidebar status
 
-Generation runs in the container's worker, so inference and loop detection continue even if you close the browser. While a chapter generates, its page streams the body and Think in progress (Think is collapsible). The sidebar shows the latest call's context fill, GPU prefill/decode speeds (servers reporting timings), and the generating chapter with its counts.
+Generation runs in the container's worker, so inference and loop detection continue even if you close the browser. While a chapter generates, its page streams the body and Think in progress (Think is collapsible). The sidebar shows context fill, GPU prefill/decode speeds (servers reporting timings), and the generating chapter with its counts.
 
 Each chapter also has its own **chapter page** (outline → generated text → **Think** (the model's reasoning) → state → revision notes). Writing **revision notes** there regenerates just that chapter with the notes included. For continuation writing, a **state chain** keeps the story state explicit: after the initial analysis, the harness outputs the source document's end-of-text "current state" (location, character states, relationships, ongoing events, unresolved threads); each chapter takes its start state as input and outputs its end state for the next, inspectable on the chapter page.
 
 ### Web search and derivative-work mode
 
-A web search mode covers words the local model doesn't know — new terms and coined words (mainly Japanese).
-
 - **Term lookup**: enter a word and the harness checks Japanese Wiktionary / Wikipedia / the web, saves a "term memo", and includes it in later generation.
-- **Term check (automatic)**: before outline and draft generation, the model itself flags words it doesn't know; terms missing from the glossary DB are looked up and added, with a notice on the work page.
-- **Glossary DB**: learned meanings are stored in a dictionary separate from workspaces. **They survive workspace deletion** and are reused by other stories (manage them from the sidebar's Glossary DB page).
+- **Term check (automatic)**: before outline and draft generation, the model itself flags words it doesn't know; terms missing from the glossary DB are looked up and added.
+- **Glossary DB**: learned meanings are stored in a separate dictionary. **They survive workspace deletion** and are reused by other stories (sidebar's Glossary DB page).
 - **Derivative-work (fanfiction) mode**: a per-work ON/OFF toggle (can be hidden in Settings; shown by default). When ON, the AI is told the work is derivative. When OFF, it judges from the text alone.
-- **Character profile search** (when derivative mode is ON): gathers public material for a character and summarizes it into a profile — first-person pronoun, forms of address, speech endings, catchphrases, mannerisms, behavior — which is then included in generation.
+- **Character profile search** (when derivative mode is ON): gathers public material for a character and summarizes a profile (pronouns, speech endings, catchphrases, mannerisms) for use in generation.
 
 Only the search terms (words and character names) leave the NAS; **manuscript text is never sent out**. Web search can be disabled entirely in Settings.
 
@@ -112,9 +110,9 @@ You can also **download / restore a full backup (zip)** at the bottom of the Set
 
 ### 2. Create a work and generate
 
-1. Create a workspace on the top page (title, concept, settings, chapter count; a source TXT can be attached at creation or dragged & dropped onto the page).
-2. Optionally upload a source text file (step 1: load source).
-3. Click "2. Next-chapter content (chapter outlines)", then edit and save (approve) each outline.
+1. Create a workspace on the top page (title, concept, settings, chapter count; a source TXT can be attached at creation or dragged & dropped).
+2. Optionally upload a source text file.
+3. Click "2. Next-chapter content (chapter outlines)", then edit and save (approve) each outline. Optionally run "2.5 Expand chapters" for detailed plans.
 4. Click "3. First pass" — instruction sheet, body, and summary are produced per chapter automatically.
 5. Click "4. Second pass" — when the Synology Chat notification arrives, switch the model on the inference PC. Revision starts automatically once detected.
 6. When done, download the combined text from the PHP page (or the work page).

@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.17"
+APP_VERSION = "1.18"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -43,6 +43,7 @@ STAGE_LABEL = {
     "analyzed": "初期文書解析済み",
     "outlining": "2. 次章の内容を生成中",
     "outline_review": "2. 次章の内容（確認・修正待ち）",
+    "plans_ready": "2.5 各章の展開計画作成済み",
     "generating": "3. 1次出力中",
     "wait_q4": "4. 2次修正（モデル切替待ち）",
     "wait_model": "4. 2次修正（モデル切替待ち）",
@@ -517,17 +518,35 @@ def work_detail(work_id: int):
                       "章ごとの入出力状態は各章ページで確認できます。</p></div>")
 
     min_chars = int(w.get("min_chars") or 0)
+    plan_pending = db.get_setting(f"plan_pending:{work_id}", "")
+    max_ch_number = max((c["number"] for c in chapters), default=0)
     ch_html = ""
     for ch in chapters:
         chars = pipeline.chapter_chars(work_id, ch["id"])
         chars_note = (f"<div class='row'>本文：{chars}文字"
                       + (f"（最低{min_chars}文字）" if min_chars > 0 else "") + "</div>") if chars else ""
+        plan_secs = pipeline.get_plan(w, ch)
+        plan_block = ""
+        if plan_secs:
+            sec_html = "".join(
+                f"<h4>{esc(name)}</h4><pre>{esc(plan_secs[name])}</pre>"
+                for name in pipeline.PLAN_SECTIONS if plan_secs.get(name))
+            cascade_btn = ""
+            if plan_pending == str(ch["number"]) and ch["number"] < max_ch_number:
+                cascade_btn = (f"<form method='post' action='/works/{w['id']}/plan_cascade' style='margin-top:.5em'>"
+                               f"<input type='hidden' name='chapter_id' value='{ch['id']}'>"
+                               f"<button style='background:#2e7d32;border-color:#2e7d32'>OK：第{ch['number'] + 1}章以降を再生成（開始状態の引き継ぎを反映）</button></form>")
+            plan_block = f"""
+        <details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>{sec_html}
+        <form method='post' action='/chapters/{ch['id']}/plan_regen'>
+        <div class='row'>追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
+        <button>追加指定でこの章の計画を再生成</button></form>{cascade_btn}</details>"""
         ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3>第{ch['number']}章 {esc(ch['title'])}（{esc(ch['status'])}）</h3>
         {chars_note}
         <form method='post' action='/chapters/{ch['id']}'>
         <div class='row'>タイトル<input type='text' name='title' value="{esc(ch['title'])}"></div>
         <div class='row'>概要<textarea name='outline' rows='4'>{esc(ch['outline'])}</textarea></div>
-        <button>概要を保存（承認）</button></form>
+        <button>概要を保存（承認）</button></form>{plan_block}
         <div class='row'><a href='/chapters/{ch['id']}'>章ページを開く（本文・Think・状態・修正要綱で再生成）</a></div>
         <form method='post' action='/chapters/{ch['id']}/delete' onsubmit="return confirm('この章を削除しますか？（本文・概要も消えます）')" style='margin-top:.5em'>
         <button style='background:#b03a3a;border-color:#b03a3a'>この章を削除</button></form></div>"""
@@ -639,6 +658,7 @@ def work_detail(work_id: int):
     <p>モード：<b>{'単章モード（1章完結・対話的に詰める）' if (w.get('mode') or 'switch') == 'single' else ('スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）')}</b>（作品情報で変更できます）</p>
     {ws_html}
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='outline'><button>2. 次章の内容（各章概要）を生成</button></form>
+    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='expand_plans'><button>2.5 各章を展開（詳細概要・開始/終了状態・内容詳細を章ごとに連鎖生成）</button></form>
     {thread_buttons if (w.get('mode') or 'switch') in ('thread', 'single') else switch_buttons}
     {single_html}
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p></div>
@@ -873,6 +893,13 @@ def chapter_page(chapter_id: int):
                      f"<pre>{esc(pipeline.read_text(loop_log['path']))}</pre></div>") if loop_log else ""
     design_html = (f"<details class='card'><summary>生成指示書</summary>"
                    f"<pre>{esc(pipeline.read_text(design['path']))}</pre></details>") if design else ""
+    plan_secs_ch = pipeline.get_plan(w, ch)
+    plan_html = ""
+    if plan_secs_ch:
+        plan_html = ("<div class='card'><h2>展開計画</h2>" + "".join(
+            f"<h3>{esc(name)}</h3><pre>{esc(plan_secs_ch[name])}</pre>"
+            for name in pipeline.PLAN_SECTIONS if plan_secs_ch.get(name))
+            + "<p>追加指定での作り直しと、OK後の次章以降の再生成は作品ページの章カードから行えます。</p></div>")
     state_html = ""
     if in_state or out_state:
         state_html = "<div class='card'><h2>状態（状態チェーン）</h2>"
@@ -894,6 +921,7 @@ def chapter_page(chapter_id: int):
     {body_html}</div>
     {live_html}
     {loop_log_html}
+    {plan_html}
     {think_html}
     {design_html}
     {state_html}
@@ -906,6 +934,25 @@ def chapter_page(chapter_id: int):
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
                 refresh=active or bool(live_html) or ch["status"] in ("generating", "revising"))
+
+
+@app.post("/chapters/{chapter_id}/plan_regen")
+def chapter_plan_regen(chapter_id: int, notes: str = Form("")):
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    enqueue(ch["work_id"], "regen_plan", {"chapter_id": chapter_id, "notes": notes})
+    return RedirectResponse(f"/works/{ch['work_id']}", status_code=303)
+
+
+@app.post("/works/{work_id}/plan_cascade")
+def work_plan_cascade(work_id: int, chapter_id: int = Form(...)):
+    """計画再生成が OK だった章の次章以降を、引き継ぎ状態で再生成する。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=? AND work_id=?", (chapter_id, work_id))
+    if ch:
+        enqueue(work_id, "expand_plans",
+                {"from_number": ch["number"] + 1, "cascade": True})
+    return RedirectResponse(f"/works/{work_id}", status_code=303)
 
 
 @app.post("/works/{work_id}/single_act")
