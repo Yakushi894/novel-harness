@@ -113,10 +113,31 @@ def detect_loop(text):
        （繰り返し回数4回以上に相当する長さがある場合のみ）
     C) 短いフレーズ（10字以上）が直近4000字以内に5回以上再出現する
        （連続していなくてもよい。会話のたびに同じ台詞が戻るタイプのループ対策）
+    D) 数字だけが違う行が6行以上連続する（「931 30」「932 30」のような
+       カウンタ型の数値ループ。数字が増えていくため完全一致にならず、
+       ルールA〜Cをすり抜ける。数字を伏せた形が同じ行の連続で判定する）
     ただし「- 所持品: 特記なし」のような項目行は、状態シートで人物ごとに
-    繰り返されるのが正常なため、ルールA・Cの数え上げから除外する。
+    繰り返されるのが正常なため、ルールA・C・Dの数え上げから除外する。
     """
-    if not text or len(text) < 500:
+    if not text:
+        return None
+    # D) 数字だけが違う行の連続（短いテキストでも判定できるため長さゲートの前に行う）
+    run_key, run = None, 0
+    for ln in text[-4000:].split("\n"):
+        s = ln.strip()
+        if (not s or _is_property_line(s)
+                or not re.search(r"[0-9０-９]", s)):
+            run_key, run = None, 0
+            continue
+        key = re.sub(r"[0-9０-９]+", "#", s)
+        if len(key) < 3:
+            run_key, run = None, 0
+            continue
+        run = run + 1 if key == run_key else 1
+        run_key = key
+        if run >= 6:
+            return {"rule": "D", "unit": key, "repeats": run, "chars": len(text)}
+    if len(text) < 500:
         return None
     tail = text[-4000:]
     # A) 文単位の連続繰り返し

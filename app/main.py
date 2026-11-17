@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.35"
+APP_VERSION = "1.36"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -158,27 +158,31 @@ def sidebar(current_id=None, chapters=None) -> str:
         works = []
     items = ""
     for w in works:
-        cls = "ws-item active" if current_id and w["id"] == current_id else "ws-item"
-        items += (f"<a class='{cls}' href='/works/{w['id']}'>{esc(w['title'])}"
-                  f"<span class='st'>{esc(STAGE_LABEL.get(w['stage'], w['stage']))}</span></a>")
-    ch_html = ""
-    if chapters:
-        items = ""
-        for c in chapters:
-            items += (
-                f"<div class='ch-item'><a href='/chapters/{c['id']}'>第{c['number']}章 {esc(c['title'])}"
-                f"（{esc(c['status'])}）</a>"
-                f"<form method='post' action='/chapters/{c['id']}/delete' "
-                "onsubmit=\"return confirm('この章を削除しますか？（本文・概要も消えます）')\" style='margin:0'>"
-                "<button class='ch-del' title='この章を削除'>✕</button></form></div>")
-        ch_html = "<div class='side-sec'>章</div>" + items
+        active = bool(current_id) and w["id"] == current_id
+        cls = "ws-item active" if active else "ws-item"
+        items += f"<a class='{cls}' href='/works/{w['id']}'>{esc(w['title'])}</a>"
+        if active:
+            # 選択中のワークスペースのときだけ、その下に章を出す。
+            chs = chapters
+            if chs is None:
+                try:
+                    chs = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number",
+                               (w["id"],))
+                except Exception:
+                    chs = []
+            for c in chs:
+                items += (
+                    f"<div class='ch-item'><a href='/chapters/{c['id']}'>第{c['number']}章 {esc(c['title'])}"
+                    f"（{esc(c['status'])}）</a>"
+                    f"<form method='post' action='/chapters/{c['id']}/delete' "
+                    "onsubmit=\"return confirm('この章を削除しますか？（本文・概要も消えます）')\" style='margin:0'>"
+                    "<button class='ch-del' title='この章を削除'>✕</button></form></div>")
     return (
         "<div class='sidebar'>"
         "<div class='brand'>📚 小説ハーネス</div>"
         "<a class='ws-item' href='/'>＋ 新規ワークスペース</a>"
         "<div class='side-sec'>ワークスペース</div>"
         + (items or "<div class='ws-item'>まだありません</div>")
-        + ch_html
         + "<div class='side-foot'>"
         f"<div>ロード中モデル：{esc(llm.loaded_model())}</div>"
         + f"<div id='dyn-side'>{_sidebar_status()}</div>"
@@ -394,15 +398,18 @@ async def create_work(title: str = Form(...), request: str = Form(""), settings:
                       num_chapters: int = Form(3), claude_ok: int = Form(0), mode: str = Form("switch"),
                       min_chars: int = Form(0), source_file: UploadFile = File(None)):
     base = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower() or "work"
-    slug = f"{base}-{int(time.time()) % 1000000}"
     if mode == "single":
         num_chapters = 1
     wid = db.run(
         "INSERT INTO works(title, slug, request, settings, num_chapters, claude_ok, mode, min_chars, created_at, updated_at)"
         " VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (title, slug, request, settings, num_chapters, claude_ok,
+        (title, f"{base}-tmp", request, settings, num_chapters, claude_ok,
          mode if mode in ("switch", "thread", "single") else "switch",
          min_chars if min_chars in MIN_CHARS_CHOICES else 0, db.now(), db.now()))
+    # slug は一意制約があるため、採番済みの id を含めて確定させる
+    # （日本語タイトル同士を同秒に作ると base と時刻だけでは衝突する）。
+    slug = f"{base}-{int(time.time()) % 1000000}-{wid}"
+    db.run("UPDATE works SET slug=? WHERE id=?", (slug, wid))
     pipeline.work_dir(slug)
     if source_file is not None and source_file.filename:
         raw = await source_file.read()
@@ -760,7 +767,7 @@ def work_detail(work_id: int):
         plan_block = ""
         if plan_secs:
             sec_html = "".join(
-                f"<h4>{esc(name)}</h4><pre>{esc(plan_secs[name])}</pre>"
+                f"<details><summary>{esc(name)}</summary><pre>{esc(plan_secs[name])}</pre></details>"
                 for name in pipeline.PLAN_SECTIONS if plan_secs.get(name))
             cascade_btn = ""
             if plan_pending == str(ch["number"]) and ch["number"] < max_ch_number:
@@ -1151,7 +1158,7 @@ def chapter_page(chapter_id: int):
                           f"<input type='hidden' name='chapter_id' value='{ch['id']}'>"
                           f"<button style='background:#2e7d32;border-color:#2e7d32'>OK：第{ch['number'] + 1}章以降を再生成（開始状態の引き継ぎを反映）</button></form>")
         plan_html = ("<div class='card'><h2>展開計画</h2>" + "".join(
-            f"<h3>{esc(name)}</h3><pre>{esc(plan_secs_ch[name])}</pre>"
+            f"<details><summary>{esc(name)}</summary><pre>{esc(plan_secs_ch[name])}</pre></details>"
             for name in pipeline.PLAN_SECTIONS if plan_secs_ch.get(name))
             + f"""<form method='post' action='/chapters/{ch['id']}/plan_regen'>
             <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
