@@ -651,14 +651,25 @@ PLAN_SECTIONS = ["詳細概要", "章開始時の状態", "章終了時の目標
 
 
 def parse_plan(text):
+    """展開計画テキストを節ごとに分解する。
+
+    節の見出し（PLAN_SECTIONS）以外の ## 見出しは、状態スナップショットが
+    埋め込まれた場合の小見出し（## 物語の現在位置、## 登場人物の状態 など）
+    なので、節の区切りではなく現在の節の本文として戻す。戻さないと
+    「章終了時の状態」が冒頭の「# 現在の状態」だけで切れてしまう。
+    """
     sections = {}
+    current = None
     for p in re.split(r"^##\s*", text or "", flags=re.M):
         if not p.strip():
             continue
         head, _, body = p.partition("\n")
         head = head.strip()
         if head in PLAN_SECTIONS:
-            sections[head] = body.strip()
+            current = head
+            sections[current] = body.strip()
+        elif current:
+            sections[current] = (sections[current] + "\n## " + p.strip()).strip()
     return sections
 
 
