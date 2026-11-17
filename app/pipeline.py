@@ -688,24 +688,47 @@ def do_expand_plans(job, work):
             continue
         if _cancelled(job):
             return
-        text = llm.chat(
-            "auto", prompts.PLAN_EXPAND_SYSTEM + sys_note(work),
-            prompts.PLAN_EXPAND_USER.format(
-                settings=settings_text(work), outlines=outlines_text(work),
-                number=ch["number"], title=ch["title"], outline=ch["outline"],
-                start_state=plan_start_state(work, ch, chapters),
-                final_note=_final_note(work, ch, chapters), notes_block=""),
-            max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-            temperature=temperature())
-        sections = parse_plan(text)
-        if not sections.get("章内容詳細") or not sections.get("章終了時の状態"):
-            save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
-            raise RuntimeError(f"第{ch['number']}章の展開計画のパースに失敗しました（モデルの生出力を成果物のログに保存しました）")
-        _save_plan(work, ch, sections)
+        _expand_one_plan(work, ch, chapters)
     if payload.get("cascade"):
         db.set_setting(f"plan_pending:{work['id']}", "")
     set_stage(work["id"], "plans_ready")
     add_notice(work, "各章の展開計画を作成しました。章ごとに確認し、追加指定があれば当該章を再生成してください。")
+
+
+def _expand_one_plan(work, ch, chapters):
+    """1章分の展開計画（詳細概要・開始/終了状態・内容詳細）を生成して保存する。
+
+    開始状態は plan_start_state（前章の計画の終了状態→状態チェーン→初期状態の
+    順で引く）を使うため、全章連鎖生成と単独生成で同じ結果になる。
+    """
+    text = llm.chat(
+        "auto", prompts.PLAN_EXPAND_SYSTEM + sys_note(work),
+        prompts.PLAN_EXPAND_USER.format(
+            settings=settings_text(work), outlines=outlines_text(work),
+            number=ch["number"], title=ch["title"], outline=ch["outline"],
+            start_state=plan_start_state(work, ch, chapters),
+            final_note=_final_note(work, ch, chapters), notes_block=""),
+        max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
+        temperature=temperature())
+    sections = parse_plan(text)
+    if not sections.get("章内容詳細") or not sections.get("章終了時の状態"):
+        save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
+        raise RuntimeError(f"第{ch['number']}章の展開計画のパースに失敗しました（モデルの生出力を成果物のログに保存しました）")
+    _save_plan(work, ch, sections)
+
+
+def do_expand_plan_one(job, work):
+    """この章のみの展開計画生成（全章連鎖の「2.5 各章を展開」の単独版）。"""
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    ch = db.one("SELECT * FROM chapters WHERE id=? AND work_id=?",
+                (payload.get("chapter_id"), work["id"]))
+    if not ch:
+        raise RuntimeError("展開計画を作る章が見つかりません。")
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work["id"],))
+    _expand_one_plan(work, ch, chapters)
 
 
 def do_regen_plan(job, work):
@@ -1193,13 +1216,14 @@ def do_regen_chapter(job, work):
                 except OSError:
                     pass
                 db.run("DELETE FROM artifacts WHERE id=?", (a["id"],))
-        update_state(work, ch, body, prev_state)
-        summary = llm.chat(
-            "auto", prompts.SUMMARY_SYSTEM,
-            prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
-            max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-            temperature=temperature())
-        save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
+        if payload.get("with_state", True):
+            update_state(work, ch, body, prev_state)
+            summary = llm.chat(
+                "auto", prompts.SUMMARY_SYSTEM,
+                prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
+                max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
+                temperature=temperature())
+            save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
     except llm.LoopDetectedError as e:
         save_loop_log(work, ch, "章の再生成", e)
         clear_partial(work, ch)
@@ -1301,6 +1325,7 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "search_term": do_search_term, "term_check": do_term_check,
             "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
             "expand_plans": do_expand_plans, "regen_plan": do_regen_plan,
+            "expand_plan_one": do_expand_plan_one,
             "revise_outline": do_revise_outline, "outline_chapter": do_outline_chapter}
 
 

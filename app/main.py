@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.30"
+APP_VERSION = "1.31"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -559,6 +559,7 @@ def _chapter_live_html(w, ch) -> str:
 
 
 CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "revise_outline": "修正概要の作成",
+                      "expand_plan_one": "展開計画の生成（この章のみ）",
                       "outline_chapter": "概要の再生成"}
 CHAPTER_JOB_KINDS = tuple(CHAPTER_JOB_LABELS)
 
@@ -677,17 +678,43 @@ def work_detail(work_id: int):
         <div class='row'>概要<textarea name='outline' rows='4'>{esc(ch['outline'])}</textarea></div>
         <button>概要を保存（承認）</button></form>
         <form method='post' action='/chapters/{ch['id']}/outline_regen' style='margin-top:.5em'>
-        <button>この章の概要だけ再生成</button></form>{plan_block}
+        <button>この章の概要だけ再生成</button></form>
+        <form method='post' action='/chapters/{ch['id']}/expand_plan' style='margin-top:.5em'>
+        <button>この章の展開計画のみ生成</button></form>{plan_block}
         <div class='row'><a href='/chapters/{ch['id']}'>章ページを開く（本文・Think・状態・修正要綱で再生成）</a></div>
         <form method='post' action='/chapters/{ch['id']}/delete' onsubmit="return confirm('この章を削除しますか？（本文・概要も消えます）')" style='margin-top:.5em'>
         <button style='background:#b03a3a;border-color:#b03a3a'>この章を削除</button></form></div>"""
 
+    # 工程の「✔ 終了済み」バッジ：直近ジョブの完了、または成果物の揃い具合で判定
+    _seen_kind = set()
+    _job_done = set()
+    for j in db.q("SELECT kind, status FROM jobs WHERE work_id=? ORDER BY id DESC", (work_id,)):
+        if j["kind"] in _seen_kind:
+            continue
+        _seen_kind.add(j["kind"])
+        if j["status"] == "done":
+            _job_done.add(j["kind"])
+    _all_ch = {c["id"] for c in chapters}
+    _plan_ch = {a["chapter_id"] for a in arts if a["kind"] == "plan"}
+    _body_ch = {a["chapter_id"] for a in arts if a["kind"] in ("draft", "final")}
+    _final_ch = {a["chapter_id"] for a in arts if a["kind"] == "final"}
+
+    def _badge(done):
+        return " <span style='color:#1a7f37;font-weight:700'>✔ 終了済み</span>" if done else ""
+
+    badge_outline = _badge(bool(chapters) or "outline" in _job_done)
+    badge_expand = _badge((bool(_all_ch) and _all_ch <= _plan_ch) or "expand_plans" in _job_done)
+    badge_gen = _badge((bool(_all_ch) and _all_ch <= _body_ch) or "generate_chapters" in _job_done)
+    badge_rev = _badge((bool(_all_ch) and _all_ch <= _final_ch) or "revise_all" in _job_done)
+    badge_thread = _badge((bool(_all_ch) and _all_ch <= _final_ch) or "generate_thread" in _job_done)
+    badge_rev_thread = _badge("revise_all" in _job_done)
+
     switch_buttons = (
-        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_chapters'><button>3. 1次出力（本文生成・現在ロード中のモデル）</button></form>"
-        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 2次修正（モデル切替を検知して自動実行）</button></form>")
+        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_chapters'><button>3. 1次出力（本文生成・現在ロード中のモデル）</button>{badge_gen}</form>"
+        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 2次修正（モデル切替を検知して自動実行）</button>{badge_rev}</form>")
     thread_buttons = (
-        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_thread'><button>3〜4. 章ごとスレッドで生成＋仕上げ（モデル切替なし・最初に選んだモデルのまま完結）</button></form>"
-        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 仕上げ修正のみ（生成済みの章を同モデルで修正）</button></form>")
+        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_thread'><button>3〜4. 章ごとスレッドで生成＋仕上げ（モデル切替なし・最初に選んだモデルのまま完結）</button>{badge_thread}</form>"
+        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 仕上げ修正のみ（生成済みの章を同モデルで修正）</button>{badge_rev_thread}</form>")
 
     single_html = ""
     if (w.get("mode") or "switch") == "single":
@@ -744,8 +771,8 @@ def work_detail(work_id: int):
     <div class='card'><h2>工程の実行</h2>
     <p>モード：<b>{'単章モード（1章完結・対話的に詰める）' if (w.get('mode') or 'switch') == 'single' else ('スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）')}</b>（作品情報で変更できます）</p>
     {ws_html}
-    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='outline'><button>2. 次章の内容（各章概要）を生成</button></form>
-    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='expand_plans'><button>2.5 各章を展開（詳細概要・開始/終了状態・内容詳細を章ごとに連鎖生成）</button></form>
+    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='outline'><button>2. 次章の内容（各章概要）を生成</button>{badge_outline}</form>
+    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='expand_plans'><button>2.5 各章を展開（詳細概要・開始/終了状態・内容詳細を章ごとに連鎖生成）</button>{badge_expand}</form>
     {thread_buttons if (w.get('mode') or 'switch') in ('thread', 'single') else switch_buttons}
     {single_html}
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p></div>
@@ -954,7 +981,8 @@ def chapter_page(chapter_id: int):
     in_state = pipeline.current_state(w, ch["number"])
     out_state = pipeline.chapter_end_state(w, ch)
     min_chars = int(w.get("min_chars") or 0)
-    jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind IN (?,?,?) "
+    _ph = ",".join("?" for _ in CHAPTER_JOB_KINDS)
+    jobs = db.q(f"SELECT * FROM jobs WHERE work_id=? AND kind IN ({_ph}) "
                 "ORDER BY id DESC LIMIT 5",
                 (w["id"],) + CHAPTER_JOB_KINDS)
     active = any(j["status"] in ("queued", "running") for j in jobs)
@@ -1033,7 +1061,17 @@ def chapter_page(chapter_id: int):
     <button>概要を保存（承認）</button></form>
     <form method='post' action='/chapters/{ch['id']}/outline_regen'>
     <button>この章の概要だけ再生成</button>
-    <span>概要が途中で切れてしまった場合などに、この章の概要だけを作り直して上書きします（本文は変わりません）。</span></form></div>
+    <span>概要が途中で切れてしまった場合などに、この章の概要だけを作り直して上書きします（本文は変わりません）。</span></form>
+    <form method='post' action='/chapters/{ch['id']}/expand_plan'>
+    <button>この章の展開計画のみ生成</button>
+    <span>この章のみ、細概要・開始/終了状態・内容詳細（展開計画）を作ります（全章一括の「2.5 各章を展開」と同じ内容を1章だけ）。</span></form>
+    <form method='post' action='/chapters/{ch['id']}/regen'>
+    <input type='hidden' name='with_state' value='0'>
+    <button>本文のみ（再）生成</button>
+    <span>本文だけを作り直します。終了状態・要約は今のまま保持します（状態チェーンは変わりません）。</span></form>
+    <form method='post' action='/chapters/{ch['id']}/regen'>
+    <button>本文＋状態（再）生成</button>
+    <span>本文に合わせて終了状態（状態チェーン）と要約も作り直します（従来の再生成）。</span></form></div>
     {status_line}
     {draft_html}
     {final_html}
@@ -1084,7 +1122,8 @@ def chapter_live(chapter_id: int):
     if not ch:
         return JSONResponse({"stop": True})
     w = db.one("SELECT * FROM works WHERE id=?", (ch["work_id"],))
-    jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND kind IN (?,?,?) "
+    _ph = ",".join("?" for _ in CHAPTER_JOB_KINDS)
+    jobs = db.q(f"SELECT * FROM jobs WHERE work_id=? AND kind IN ({_ph}) "
                 "ORDER BY id DESC LIMIT 5",
                 (w["id"],) + CHAPTER_JOB_KINDS)
     active = (any(j["status"] in ("queued", "running") for j in jobs)
@@ -1148,11 +1187,22 @@ async def work_single_act(work_id: int, notes: str = Form(""), file: UploadFile 
 
 
 @app.post("/chapters/{chapter_id}/regen")
-def chapter_regen(chapter_id: int, notes: str = Form("")):
+def chapter_regen(chapter_id: int, notes: str = Form(""), with_state: str = Form("1")):
     ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
     if not ch:
         return RedirectResponse("/", status_code=303)
-    enqueue(ch["work_id"], "regen_chapter", {"chapter_id": chapter_id, "notes": notes})
+    enqueue(ch["work_id"], "regen_chapter",
+            {"chapter_id": chapter_id, "notes": notes, "with_state": with_state != "0"})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/expand_plan")
+def chapter_expand_plan(chapter_id: int):
+    """この章のみの展開計画（詳細概要・開始/終了状態・内容詳細）を生成する。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    enqueue(ch["work_id"], "expand_plan_one", {"chapter_id": chapter_id})
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 
