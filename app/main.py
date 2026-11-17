@@ -23,7 +23,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.16"
+APP_VERSION = "1.17"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -542,9 +542,11 @@ def work_detail(work_id: int):
     single_html = ""
     if (w.get("mode") or "switch") == "single":
         sch = chapters[0] if chapters else None
+        src_names = "".join(
+            f"<div>📄 {esc(os.path.basename(a['path']))}</div>"
+            for a in arts if a["kind"] == "source")
         if sch is None:
-            single_inner = ("<p>まだ章がありません。まず「2. 次章の内容（各章概要）を生成」を押してください。"
-                            "概要ができたら、下の指示欄から生成を始められます。</p>")
+            gen_inner = "<p>まだ生成されていません。上の指示を送ると、概要作成から生成まで一括で進みます。</p>"
         else:
             s_final = pipeline.latest_artifact(w["id"], sch["id"], "final")
             s_draft = pipeline.latest_artifact(w["id"], sch["id"], "draft")
@@ -552,22 +554,29 @@ def work_detail(work_id: int):
             s_think = pipeline.latest_artifact(w["id"], sch["id"], "think")
             sp_body, sp_think = pipeline.read_partial(w, sch)
             if sp_body is not None and sch["status"] in ("generating", "revising"):
-                single_inner = (f"<p>生成中（逐次表示）：本文 {len(sp_body):,}字 ／ Think {len(sp_think or ''):,}字</p>"
-                                f"<pre>{esc(sp_body)}</pre>")
+                gen_inner = (f"<p>生成中（逐次表示）：本文 {len(sp_body):,}字 ／ Think {len(sp_think or ''):,}字</p>"
+                             f"<pre>{esc(sp_body)}</pre>")
+                if sp_think:
+                    gen_inner += (f"<details><summary>Think（生成中・逐次）</summary>"
+                                  f"<pre>{esc(sp_think)}</pre></details>")
             elif s_body_art:
-                single_inner = f"<pre>{esc(pipeline.read_text(s_body_art['path']))}</pre>"
+                gen_inner = f"<pre>{esc(pipeline.read_text(s_body_art['path']))}</pre>"
                 if s_think:
-                    single_inner += (f"<details><summary>Think（思考過程）</summary>"
-                                     f"<pre>{esc(pipeline.read_text(s_think['path']))}</pre></details>")
+                    gen_inner += (f"<details><summary>Think（思考過程）</summary>"
+                                  f"<pre>{esc(pipeline.read_text(s_think['path']))}</pre></details>")
             else:
-                single_inner = "<p>本文はまだありません。下の指示欄から生成を始められます。</p>"
+                gen_inner = "<p>まだ生成されていません。上の指示を送ると生成が始まります。</p>"
         single_html = f"""
-    <div class='card'><h2>単章モード（対話的に詰める）</h2>
-    {single_inner}
-    <form method='post' action='/works/{w['id']}/single_act'>
-    <div class='row'>指示（生成の方向性／直したい点。空欄でも可）<textarea name='notes' rows='3'></textarea></div>
-    <button>指示して生成／再生成</button></form>
-    <p>章がない場合は概要生成、概要だけの場合は生成＋仕上げ、本文がある場合は指示を含めて再生成します。</p></div>"""
+    <div class='card'><h2>単章モード</h2>
+    <h3>指示</h3>
+    <form method='post' action='/works/{w['id']}/single_act' enctype='multipart/form-data'>
+    <div class='row'><textarea name='notes' rows='4' placeholder='書きたい内容・直したい点など'></textarea></div>
+    <div class='row'>TXT添付（任意・素材として生成に反映されます）<input type='file' name='file' accept='.txt,.md,.text,text/plain'></div>
+    {('<p>添付済み：</p>' + src_names) if src_names else ''}
+    <button>生成する</button></form>
+    <h3>生成欄</h3>
+    {gen_inner}
+    </div>"""
 
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
     notice_html = ""
@@ -900,19 +909,32 @@ def chapter_page(chapter_id: int):
 
 
 @app.post("/works/{work_id}/single_act")
-def work_single_act(work_id: int, notes: str = Form("")):
-    """単章モードの指示フォーム：状態に応じて次の工程を自動で選ぶ。"""
+async def work_single_act(work_id: int, notes: str = Form(""), file: UploadFile = File(None)):
+    """単章モード：指示（TXT添付込み）⇒生成欄。状態に応じて次の工程を自動で選ぶ。
+
+    添付 TXT は素材（source）として保存され、以降の生成すべてに反映される。
+    章がない場合は概要生成と生成＋仕上げを続けてキューに入れ、1回の送信で
+    生成まで進む。初回生成では指示文を作品の「欲しい内容」へ追記して効かせる。
+    """
+    w = db.one("SELECT * FROM works WHERE id=?", (work_id,))
+    if file is not None and file.filename:
+        raw = await file.read()
+        if raw:
+            text = raw.decode("utf-8", errors="replace")
+            name = re.sub(r"[^\w.\-]+", "_", file.filename or "source.txt")
+            pipeline.save_artifact(w, None, "source", name, text)
     chs = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work_id,))
-    if not chs:
-        enqueue(work_id, "outline")
+    if chs and chs[0]["status"] in ("generating", "revising"):
+        return RedirectResponse(f"/works/{work_id}", status_code=303)  # 生成中は何もしない
+    if not chs or chs[0]["status"] in ("outlined", "pending"):
+        if notes.strip() and notes.strip() not in (w["request"] or ""):
+            db.run("UPDATE works SET request=?, updated_at=? WHERE id=?",
+                   (((w["request"] or "") + "\n" + notes.strip()).strip(), db.now(), work_id))
+        if not chs:
+            enqueue(work_id, "outline")
+        enqueue(work_id, "generate_thread")
     else:
-        ch = chs[0]
-        if ch["status"] in ("outlined", "pending"):
-            enqueue(work_id, "generate_thread")
-        elif ch["status"] in ("generating", "revising"):
-            pass  # 生成中は何もしない
-        else:
-            enqueue(work_id, "regen_chapter", {"chapter_id": ch["id"], "notes": notes})
+        enqueue(work_id, "regen_chapter", {"chapter_id": chs[0]["id"], "notes": notes})
     return RedirectResponse(f"/works/{work_id}", status_code=303)
 
 

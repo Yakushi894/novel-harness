@@ -20,7 +20,7 @@ Workspaces are **per story**: one workspace per story/document; a new story gets
 4. **Second pass (revision)**: Once all chapters exist, the container posts "please switch the model" to Synology Chat. When the model on the inference server changes, the container detects it via `/v1/models` and starts the revision automatically. **The wait has no timeout** — if the notification is missed overnight, the generated drafts stay put and work resumes when the switch happens (with re-notifications).
    - The second pass is a **proofreading** pass: it must not change the meaning, content, or plot. It only fixes particles and grammar, typos, unnatural Japanese, and stray Chinese/English (converted to Japanese) — except a foreign character's own lines.
    - **Thread mode (no switching)** is also available per work: with the model chosen at the start, each chapter runs in its own thread (independent context) from draft to finishing revision. Each thread receives the uploaded TXT and the chapter outlines, but not other chapters' body text, which keeps the context short.
-   - **Single-chapter mode**: for one-chapter works; drive outline → generation + finishing → instructed regeneration from the instruction box on the work page.
+   - **Single-chapter mode**: for one-chapter works; an "instructions (TXT attachable) → output" form on the work page (one submit runs outline through generation; then instructed regen).
 5. **PHP / TXT output**: A small PHP page (Synology Web Station) concatenates the final chapters for on-screen reading and .txt download.
 
 ### The model follows the remote API
@@ -137,5 +137,5 @@ The output page is a formatted reading page (serif type, table of contents, hori
 
 - Strata-family servers have **no model-switching API** (only `POST /load` / `POST /unload`). The revision pass is therefore "notify + manual switch + automatic detection" by design.
 - Thinking tokens count toward the output cap. Caps live in Settings (Max Tokens) and are re-allocated automatically when the Context Window changes.
-- The UI is intended for LAN / Tailscale access only. Do not expose it directly to the internet.
+- The UI is for LAN / Tailscale access only. Do not expose it to the internet.
 - Review by Muse is an opt-in lane: only works you explicitly mark as "Muse review OK" are ever sent; everything else never leaves the local network.
