@@ -350,7 +350,7 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
     （逐次表示・ライブ状態の保存用。呼び出し側で間引くこと）。
     各呼び出しは独立した文脈（別スレッド）で実行されるため、出力上限は対象
     ウィンドウ（window 指定時はその値、なければ設定の Context Window）の
-    80%で頭打ちにする。
+    90%で頭打ちにする（本文生成・2次修正は呼び出し側で80%に決めている）。
     """
     global LAST_THINKING
     if model in (None, "", "auto"):
@@ -362,7 +362,7 @@ def chat(model, system, user, max_tokens=8192, temperature=0.8, timeout_s=3600.0
         except ValueError:
             _win = 0
     if _win > 0:
-        max_tokens = min(max_tokens, int(_win * 0.8))
+        max_tokens = min(max_tokens, int(_win * 0.9))
     if MOCK:
         text = _mock_response(system, user)
         LAST_THINKING = "（モック思考）この章では手紙の差出人への伏線を置き、灯台守の口調を資料どおりに保つ。視点は三人称のまま、場面は港の夕景から始める。"

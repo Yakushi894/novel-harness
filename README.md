@@ -64,9 +64,9 @@
 Web UI の「設定」画面から変更でき、即時反映されます（再起動不要）。
 
 - 接続先URL（XeStrata の API）と API キー（LAN 内でキー不要なら空でOK）
-- **Model Context Window**（変更すると各 Max Tokens がその場で自動再配置。Window の80%を超える値には赤文字で警告）
-- **Context Window（2次修正用）**：モデルが変わる前提の別枠（既定 512k）。2次修正は常に対象ウィンドウの80%を Max Tokens に自動設定（同モデル時も通常ウィンドウで80%）
-- **Max Tokens**（概要／生成指示書／本文／要約／2次修正ごと）
+- **Model Context Window**（変更すると各 Max Tokens がその場で自動再配置。Window の90%を超える値には赤文字で警告）
+- **Context Window（2次修正用）**：モデルが変わる前提の別枠（既定 512k）。2次修正は常に対象ウィンドウの80%を Max Tokens に自動設定（同モデル時も80%）
+- **Max Tokens**（章概要作成／初期読み込み・指示書／本文／要約／2次修正ごと）
 - Temperature、2次修正モデルの目印、Synology Chat Webhook URL
 
 UI トークンも、LAN 内のみの利用なら不要です（環境変数 `UI_TOKEN` が空なら認証なし）。

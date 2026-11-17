@@ -38,20 +38,35 @@ def allocate_tokens(ctx):
     """Context Window から各工程の Max Tokens を自動再配置する配分（初期値）。
 
     各工程は独立した呼び出し（別スレッド）で実行され、文脈を持ち越さないため、
-    合計で配り合う必要はない。本文は別スレッドの80%まで使う贅沢仕様：
-    概要10%／指示書・解析5%／本文80%／要約5%／2次修正80%（この ctx 基準の値。
-    2次修正の実行時は対象ウィンドウの80%を使い、設定画面の表示も実行値）。
+    合計で配り合う必要はなく、作業のまとまりごとに枠を決める：
+    章概要作成（全体概要・章ごとの概要・修正概要・展開計画）90%／
+    初期読み込み・生成指示書（文書解析＋指示書。解析は出力が長くなりがちで
+    実測約17,000トークン）45%／本文生成80%／要約・状態更新3%（短い出力用）／
+    2次修正80%（この ctx 基準の値。実行時は対象ウィンドウの80%を使う）。
     256 単位に丸め、工程ごとの下限を保証する。
     """
     def _v(pct, lo):
         return max(lo, (int(int(ctx) * pct) // 256) * 256)
     return {
-        "max_tokens_outline": _v(0.10, 1024),
-        "max_tokens_design": _v(0.05, 1024),
+        "max_tokens_outline": _v(0.90, 4096),
+        "max_tokens_design": _v(0.45, 4096),
         "max_tokens_chapter": _v(0.80, 4096),
-        "max_tokens_summary": _v(0.05, 512),
+        "max_tokens_summary": _v(0.03, 2048),
         "max_tokens_revise": _v(0.80, 4096),
     }
+
+
+def ensure_alloc_v2():
+    """配分見直し（v1.25）への一回限りの移行。
+
+    旧配分（概要10%／指示書・解析5%など）で保存された Max Tokens を、新しい
+    配分で一度だけ上書きする。以後の手動調整には干渉しない。
+    """
+    if db.get_setting("alloc_v2", ""):
+        return
+    for key, val in allocate_tokens(ctx_window()).items():
+        db.set_setting(key, str(val))
+    db.set_setting("alloc_v2", "1")
 
 
 def body_max_tokens():
@@ -660,7 +675,7 @@ def do_expand_plans(job, work):
                 number=ch["number"], title=ch["title"], outline=ch["outline"],
                 start_state=plan_start_state(work, ch, chapters),
                 final_note=_final_note(work, ch, chapters), notes_block=""),
-            max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
+            max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
             temperature=temperature())
         sections = parse_plan(text)
         if not sections.get("章内容詳細") or not sections.get("章終了時の状態"):
@@ -698,7 +713,7 @@ def do_regen_plan(job, work):
             start_state=sections.get("章開始時の状態", ""),
             notes=notes or "（追加指定なし：内容詳細以降を練り直す）",
             final_note=_final_note(work, ch, chapters)),
-        max_tokens=max_tokens("max_tokens_design", "MAX_TOKENS_DESIGN", 8192),
+        max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
         temperature=temperature())
     new = parse_plan(text)
     if not new.get("章内容詳細") or not new.get("章終了時の状態"):
