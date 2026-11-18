@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.49"
+APP_VERSION = "1.50"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -665,7 +665,7 @@ def _peek_text(work, ch):
         return "生成途中の本文（末尾）", body, None
     log = pipeline.latest_artifact(work["id"], ch["id"], "log")
     if log:
-        return "異常終了時の出力（末尾）", pipeline.read_text(log["path"]), log["id"]
+        return "異常終了時用の確認出力（末尾）", pipeline.read_text(log["path"]), log["id"]
     art = (pipeline.latest_artifact(work["id"], ch["id"], "final")
            or pipeline.latest_artifact(work["id"], ch["id"], "draft"))
     if art:
