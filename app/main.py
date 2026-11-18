@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.48"
+APP_VERSION = "1.49"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -918,6 +918,11 @@ def work_detail(work_id: int):
         <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
         <button>追加指定を考慮して再生成</button></form>{cascade_btn}
         <details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>{sec_html}</details>"""
+        design_art = pipeline.latest_artifact(w["id"], ch["id"], "prompt")
+        design_block = ""
+        if design_art:
+            design_block = (f"<details><summary>生成指示書</summary>"
+                            f"<pre>{esc(pipeline.read_text(design_art['path']))}</pre></details>")
         ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3>第{ch['number']}章 {esc(ch['title'])}（<span id='ch-status-{ch['number']}'>{esc(ch['status'])}</span>）</h3>
         {chars_note}
         <form method='post' action='/chapters/{ch['id']}'>
@@ -927,7 +932,7 @@ def work_detail(work_id: int):
         <form method='post' action='/chapters/{ch['id']}/outline_regen' style='margin-top:.5em'>
         <button>この章の概要だけ再生成</button></form>
         <form method='post' action='/chapters/{ch['id']}/expand_plan' style='margin-top:.5em'>
-        <button>この章の展開計画のみ生成</button></form>{plan_block}
+        <button>この章の展開計画のみ生成</button></form>{plan_block}{design_block}
         <div class='row'><a href='/chapters/{ch['id']}'>章ページを開く（本文・Think・状態・修正要綱で再生成）</a></div>
         <form method='post' action='/chapters/{ch['id']}/delete' onsubmit="return confirm('この章を削除しますか？（本文・概要も消えます）')" style='margin-top:.5em'>
         <button style='background:#b03a3a;border-color:#b03a3a'>この章を削除</button></form></div>"""
