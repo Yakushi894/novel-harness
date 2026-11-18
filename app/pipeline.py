@@ -284,7 +284,7 @@ def is_fanfic(work):
 
 
 def is_continuation(work):
-    """続き作品：読み込んだ文書を便宜上すべて第1章とし、生成は第2章から始める。"""
+    """続き作品：読み込んだ文書を第0章として読み込み、生成は第1章から始める。"""
     return int(work.get("continuation") or 0) == 1
 
 
@@ -570,29 +570,35 @@ def do_analyze(job, work):
         temperature=temperature(), phase="初期状態（状態チェーン）を抽出中")
     save_artifact(work, None, "state", "state_initial.txt", state)
     if is_continuation(work):
-        _register_first_chapter(work, state)
+        _register_prologue_chapter(work, state)
     set_stage(work["id"], "analyzed")
     notify(f"【小説ハーネス】「{work['title']}」の初期文書解析が完了しました。解析結果と現在の状態が以降の生成に反映されます。")
 
 
-def _register_first_chapter(work, state):
-    """続き作品：読み込んだ文書を便宜上すべて第1章として登録する。
+def _register_prologue_chapter(work, state):
+    """続き作品：読み込んだ文書を第0章として登録する（v1.42 で第1章から変更）。
 
-    アップロード済み文書（source 全部）を第1章の本文（著者の完成文なので
-    final として保存）し、解析で抽出した状態を第1章の終了状態として
-    状態チェーンに載せる。以後の生成は第2章から始まる。
+    アップロード済み文書（source 全部）を第0章の本文（著者の完成文なので
+    final として保存）し、解析で抽出した状態を第0章の終了状態として
+    状態チェーンに載せる。生成は第1章から始まる。第0章は生成・作り直しの
+    対象にしない（各生成ジョブの章選択から number>=1 で除外する）。
     """
     srcs = db.q("SELECT * FROM artifacts WHERE work_id=? AND kind='source' ORDER BY id", (work["id"],))
     if not srcs:
         return
     text = "\n\n".join(read_text(a["path"]) for a in srcs)
-    ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=1", (work["id"],))
+    # v1.40 で第1章として登録された既存文書は第0章へ付け替える（移行）
+    legacy = db.one("SELECT * FROM chapters WHERE work_id=? AND number=1 AND title='既存文書'",
+                    (work["id"],))
+    if legacy and not db.one("SELECT id FROM chapters WHERE work_id=? AND number=0", (work["id"],)):
+        db.run("UPDATE chapters SET number=0 WHERE id=?", (legacy["id"],))
+    ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=0", (work["id"],))
     if not ch:
         cid = db.run("INSERT INTO chapters(work_id, number, title, outline, status) "
-                     "VALUES(?,1,'既存文書','','generated')", (work["id"],))
+                     "VALUES(?,0,'既存文書','','generated')", (work["id"],))
         ch = db.one("SELECT * FROM chapters WHERE id=?", (cid,))
-    save_artifact(work, ch, "final", "ch001.txt", text)
-    save_artifact(work, ch, "state", "ch001_state.txt", state)
+    save_artifact(work, ch, "final", "ch000.txt", text)
+    save_artifact(work, ch, "state", "ch000_state.txt", state)
 
 
 _KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -665,7 +671,7 @@ def do_outline(job, work):
             raise RuntimeError("概要のパースに失敗しました（自動リトライ1回でも読み取れず。モデルの生出力を成果物のログに保存しました）")
     if (work.get("mode") or "switch") == "single":
         found = [(1, found[0][1], found[0][2])]  # 単章モードは最初の1章だけに絞る
-    db.run("DELETE FROM chapters WHERE work_id=?", (work["id"],))
+    db.run("DELETE FROM chapters WHERE work_id=? AND number>=1", (work["id"],))
     for num, title, body in found:
         db.run("INSERT INTO chapters(work_id, number, title, outline, status) VALUES(?,?,?,?,'outlined')",
                (work["id"], int(num), title.strip(), body.strip()))
@@ -750,7 +756,7 @@ def do_expand_plans(job, work):
     if not chapters:
         raise RuntimeError("先に各章概要を生成してください")
     for ch in chapters:
-        if ch["number"] < from_number:
+        if ch["number"] < max(from_number, 1):
             continue
         if _cancelled(job):
             return
@@ -1030,7 +1036,7 @@ def do_generate_chapters(job, work):
         run_term_check(work)
     except Exception:
         pass
-    chapters = db.q("SELECT * FROM chapters WHERE work_id=? AND status IN ('outlined','generated') ORDER BY number",
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? AND number>=1 AND status IN ('outlined','generated') ORDER BY number",
                     (work["id"],))
     if not _body_pass(job, work, chapters):
         return
@@ -1041,12 +1047,16 @@ def do_generate_chapters(job, work):
 
 def _prev_end_state_exists(work, number):
     """number 章の生成に必要な前章（number-1）の終了状態（状態チェーン）があるか。"""
-    if number <= 1:
+    if number <= 0:
         return True
     prev = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?", (work["id"], number - 1))
-    if not prev:
-        return False
-    return bool(chapter_end_state(work, prev))
+    if prev:
+        return bool(chapter_end_state(work, prev))
+    if number == 1:
+        # 第0章レコードが無い第1章：続き作品は初期状態（文書解析）で代替できる。
+        # 通常作品の第1章は状態なしで開始できる。
+        return bool(current_state(work, 1)) if is_continuation(work) else True
+    return False
 
 
 def _range_one_outline(work, ch):
@@ -1094,11 +1104,13 @@ def do_range_generate(job, work):
     except Exception:
         pass
     if payload.get("analyze_first") and is_continuation(work):
-        first = db.one("SELECT * FROM chapters WHERE work_id=? AND number=1", (work["id"],))
+        first = db.one("SELECT * FROM chapters WHERE work_id=? AND number=0", (work["id"],))
         if not first:
             do_analyze(job, work)
             work = db.one("SELECT * FROM works WHERE id=?", (work["id"],)) or work
-    if lo >= 2 and not _prev_end_state_exists(work, lo):
+    if redo and lo < 1:
+        raise RuntimeError("第0章（読み込んだ文書）は作り直しの対象にできません")
+    if lo >= 1 and not _prev_end_state_exists(work, lo):
         raise RuntimeError(f"第{lo - 1}章の終了状態（キャラ表含む）がありません。"
                            "先に前半の本文生成を完了してください")
     # --- 概要を1章ずつ ---
@@ -1199,7 +1211,7 @@ def do_generate_thread(job, work):
         run_term_check(work)
     except Exception:
         pass
-    chapters = db.q("SELECT * FROM chapters WHERE work_id=? AND status IN ('outlined','generated') ORDER BY number",
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? AND number>=1 AND status IN ('outlined','generated') ORDER BY number",
                     (work["id"],))
     for ch in chapters:
         if _cancelled(job):

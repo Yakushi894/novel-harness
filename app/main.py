@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.41"
+APP_VERSION = "1.42"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -450,7 +450,8 @@ def index():
     <label><input type='radio' name='mode' value='thread'> スレッドモード（モデル切替なし・章ごとに別スレッドで完結）</label><br>
     <label><input type='radio' name='mode' value='single'> 単章モード（1章完結・指示を出しながら対話的に詰める）</label></div>
     <div class='row'><label><input type='checkbox' name='claude_ok' value='1'> Muse監修レーン可</label></div>
-    <div class='row'><label><input type='checkbox' name='continuation' value='1'> 続きを書く（読み込んだ文書を第1章として2章から開始・長編向け）</label></div>
+    <div class='row'><label><input type='checkbox' name='continuation' value='1'> 続きを書く（長編向け）</label></div>
+    <div class='row' style='color:#c0392b;font-weight:700'>※「続きを書く」の場合、読み込んだ文書は「第0章」として読み込まれます。新しい本文の生成は第1章から始まります。</div>
     <button>作成</button></form></div>"""
     steps = "<p class='steps'>工程：" + " ⇒ ".join(FLOW_STEPS) + "</p>"
     return page("小説ハーネス", setup_banner() + steps + items + form + DROP_SCRIPT_INDEX)
@@ -917,7 +918,7 @@ def work_detail(work_id: int):
     if (w.get("mode") or "switch") != "single":
         _cont = pipeline.is_continuation(w)
         _def = w["num_chapters"] or 3
-        _first_label = ("本文解析＋第1章終了時の状態解析をして、第2章" if _cont else "第1章")
+        _first_label = ("本文解析＋第0章（読み込んだ文書）終了時の状態解析をして、第1章" if _cont else "第1章")
         range_html = f"""
     <div class='card'><h2>長編向け：範囲指定で生成（概要＋本文・推敲なし）</h2>
     <p>概要を1章ずつ作るので、10章を超える長編でも一括生成の失敗が起きにくい作りです。本文は1次出力（推敲なし）までで止まります。推敲（2次修正／仕上げ）は上の工程ボタンを別に押してください。</p>
@@ -928,7 +929,7 @@ def work_detail(work_id: int):
     <button name='range_mode' value='cont'>この章から続きを作成（次の章から）</button>
     <button name='range_mode' value='redo'>この章から作り直し</button></div>
     </form>
-    <p>後半の実行には、開始章の前章の終了状態（キャラ表含む状態チェーン）が必要です。ない場合はお知らせに表示して実行しません。作り直しでは対象章の概要と本文を作り直します（旧本文は前版として自動で残ります）。</p></div>"""
+    <p>後半の実行には、開始章の前章の終了状態（キャラ表含む状態チェーン）が必要です。ない場合はお知らせに表示して実行しません。作り直しでは対象章の概要と本文を作り直します（旧本文は前版として自動で残ります）。{'続き作品では、境の章に0を指定すると第0章（読み込んだ文書）の続きとして第1章から作成します。' if _cont else ''}</p></div>"""
 
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
     notice_html = ""
@@ -991,7 +992,8 @@ def work_detail(work_id: int):
     <label><input type='radio' name='mode' value='switch' {'checked' if (w.get('mode') or 'switch') == 'switch' else ''}> 切替モード</label>
     <label><input type='radio' name='mode' value='thread' {'checked' if (w.get('mode') or 'switch') == 'thread' else ''}> スレッドモード（切替なし）</label>
     <label><input type='radio' name='mode' value='single' {'checked' if (w.get('mode') or 'switch') == 'single' else ''}> 単章モード（1章完結）</label></div>
-    <div class='row'><label><input type='checkbox' name='continuation' value='1' {'checked' if pipeline.is_continuation(w) else ''}> 続きを書く（読み込んだ文書を第1章として2章から開始・長編向け）</label></div>
+    <div class='row'><label><input type='checkbox' name='continuation' value='1' {'checked' if pipeline.is_continuation(w) else ''}> 続きを書く（長編向け）</label></div>
+    <div class='row' style='color:#c0392b;font-weight:700'>※「続きを書く」の場合、読み込んだ文書は「第0章」として読み込まれます。新しい本文の生成は第1章から始まります。</div>
     <button>保存</button></form></div>
     <div class='card'><h2>ワークスペースの削除</h2>
     <form method='post' action='/works/{w['id']}/delete' onsubmit="return confirm('このワークスペースを削除しますか？（作品データが消えます。用語DBは残ります）')">
@@ -1189,7 +1191,7 @@ def work_range(work_id: int, range_mode: str = Form(...),
         return RedirectResponse(f"/works/{work_id}", status_code=303)
 
     if range_mode == "first":
-        lo = 2 if cont else 1
+        lo = 1
         hi = max(lo, int(x or 0))
         if cont and not db.q("SELECT id FROM artifacts WHERE work_id=? AND kind='source'", (work_id,)):
             pipeline.add_notice(w, "解析する文書がありません（ファイルがアップロードされていません）。"
@@ -1198,15 +1200,17 @@ def work_range(work_id: int, range_mode: str = Form(...),
         payload = {"from": lo, "to": hi, "analyze_first": cont}
     elif range_mode in ("cont", "redo"):
         base = int(x2 or 0)
-        if base < 1:
-            pipeline.add_notice(w, "境の章番号を指定してください。")
+        if range_mode == "redo" and base < 1:
+            pipeline.add_notice(w, "第0章（読み込んだ文書）は作り直しの対象にできません。"
+                                   "第1章以降を指定してください。" if cont else
+                                   "境の章番号を指定してください。")
             return back()
-        if cont and range_mode == "redo" and base < 2:
-            pipeline.add_notice(w, "第1章は読み込んだ文書なので作り直しできません。第2章以降を指定してください。")
+        if base < 1 and not (cont and range_mode == "cont"):
+            pipeline.add_notice(w, "境の章番号を指定してください。")
             return back()
         lo = base + 1 if range_mode == "cont" else base
         hi = max(lo, int(X or 0))
-        if lo >= 2 and not pipeline._prev_end_state_exists(w, lo):
+        if lo >= 1 and not pipeline._prev_end_state_exists(w, lo):
             pipeline.add_notice(w, f"第{lo - 1}章の終了状態（キャラ表含む）がありません。"
                                    "先に前半の本文生成を完了してください")
             return back()
@@ -1331,7 +1335,7 @@ def chapter_page(chapter_id: int):
         state_html += "</details>"
 
     prev_state_html = ""
-    if ch["number"] > 1:
+    if ch["number"] >= 1:
         prev_ch = next((c for c in chapters if c["number"] == ch["number"] - 1), None)
         pstate = pipeline.chapter_end_state(w, prev_ch) if prev_ch else ""
         if pstate:
