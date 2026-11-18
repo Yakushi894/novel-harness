@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.43"
+APP_VERSION = "1.44"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -1271,8 +1271,7 @@ def work_range(work_id: int, range_mode: str = Form(...),
         lo = base + 1 if range_mode == "cont" else base
         hi = max(lo, int(X or 0))
         if lo >= 1 and not pipeline._prev_end_state_exists(w, lo):
-            pipeline.add_notice(w, f"第{lo - 1}章の終了状態（キャラ表含む）がありません。"
-                                   "先に前半の本文生成を完了してください")
+            pipeline.add_notice(w, pipeline._missing_state_message(w, lo - 1))
             return back()
         payload = {"from": lo, "to": hi, "redo": range_mode == "redo"}
     else:

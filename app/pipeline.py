@@ -1045,6 +1045,26 @@ def do_generate_chapters(job, work):
            "2次修正に使うモデルへ切り替えて下さい。")
 
 
+def _missing_state_message(work, number):
+    """前章（number）の終了状態がない場合の案内文（お知らせ・エラー共用）。
+
+    前章の行がある場合は、その章ページの「本文＋状態（再）生成」ボタンを
+    名指しで案内する（ループ検出で止まって本文・状態が作られなかった場合の
+    復旧手順がこれ）。第0章（読み込んだ文書）は文書解析が復旧手順になる。
+    前章の行自体が無い場合は前半の生成を案内する。
+    """
+    if number == 0:
+        return ("第0章（読み込んだ文書）の終了状態（キャラ表含む）がありません。"
+                "先に「1. 続き読み込み」を実行して、文書の解析と終了状態の抽出をしてください。")
+    prev = db.one("SELECT id FROM chapters WHERE work_id=? AND number=?", (work["id"], number))
+    if prev:
+        return (f"第{number}章の終了状態（キャラ表含む）がありません。"
+                f"第{number}章の章ページで「本文＋状態（再）生成」を押して、"
+                f"第{number}章の本文と終了状態を作ってください。")
+    return (f"第{number}章の終了状態（キャラ表含む）がありません。"
+            f"先に「前半を作成」などで第{number}章までの本文生成を完了してください。")
+
+
 def _prev_end_state_exists(work, number):
     """number 章の生成に必要な前章（number-1）の終了状態（状態チェーン）があるか。"""
     if number <= 0:
@@ -1111,8 +1131,7 @@ def do_range_generate(job, work):
     if redo and lo < 1:
         raise RuntimeError("第0章（読み込んだ文書）は作り直しの対象にできません")
     if lo >= 1 and not _prev_end_state_exists(work, lo):
-        raise RuntimeError(f"第{lo - 1}章の終了状態（キャラ表含む）がありません。"
-                           "先に前半の本文生成を完了してください")
+        raise RuntimeError(_missing_state_message(work, lo - 1))
     # --- 概要を1章ずつ ---
     for n in range(lo, hi + 1):
         if _cancelled(job):
