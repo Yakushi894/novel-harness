@@ -520,6 +520,7 @@ def ensure_min_chars(job, work, ch, body, progress=None):
                 settings=settings_text(work),
                 outlines=outlines_text(work),
                 summaries=summaries_text(work, ch["number"]),
+                forbidden=forbidden_scope_text(work, ch),
                 tail=body[-2500:],
                 current=len(body), target=target,
                 need=need, round_min=min(need, 3000)),
@@ -954,6 +955,28 @@ def plan_instruction(work, ch):
     return ("\n\n【章の展開計画】\n" + plan_to_text(sections)) if sections else ""
 
 
+def forbidden_scope_text(work, chapter):
+    """「書いてはいけない範囲（次章の内容）」のテキストを組み立てる。
+
+    本文が次章の内容へ踏み込むのを防ぐため、次章の開始状態（この章の
+    展開計画の「次章開始状態」）と次章の概要を、禁止範囲として明示する。
+    """
+    parts = []
+    plan = get_plan(work, chapter)
+    if plan and (plan.get("次章開始状態") or "").strip():
+        parts.append("・次章は次の状態から始まります（この状態を作る出来事は次章の担当です。"
+                     "この章では、その出来事そのものを書かないでください）：\n" + plan["次章開始状態"])
+    nxt = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?",
+                 (work["id"], chapter["number"] + 1))
+    if nxt and (nxt["outline"] or "").strip():
+        parts.append(f"・第{nxt['number']}章「{nxt['title']}」の概要（この章では書かないでください）：\n"
+                     + nxt["outline"])
+    if not parts:
+        return ("（次章の指定はありません。それでも、この章の概要と展開計画の範囲を"
+                "超えて物語を先へ進めないでください）")
+    return "\n\n".join(parts)
+
+
 def design_prompt(work, chapter, intent, use_tail=True):
     text = llm.chat(
         "auto", prompts.PROMPT_DESIGN_SYSTEM + sys_note(work),
@@ -999,6 +1022,7 @@ def _body_pass(job, work, chapters, thread=False):
                     summaries=summaries_text(work, ch["number"]),
                     prev_tail="" if thread else prev_tail(work, ch["number"]),
                     number=ch["number"], title=ch["title"], outline=ch["outline"],
+                    forbidden=forbidden_scope_text(work, ch),
                     min_chars_note=min_chars_note(work)),
                 max_tokens=body_max_tokens(),
                 temperature=temperature(), progress=pw, body=True, phase=f"第{ch['number']}章 本文を生成中")
@@ -1251,6 +1275,7 @@ def do_generate_thread(job, work):
                         summaries=summaries_text(work, ch["number"]),
                         prev_tail="",
                         number=ch["number"], title=ch["title"], outline=ch["outline"],
+                        forbidden=forbidden_scope_text(work, ch),
                         min_chars_note=min_chars_note(work)),
                     max_tokens=body_max_tokens(),
                     temperature=temperature(), progress=pw, body=True, phase=f"第{ch['number']}章 本文を生成中")
@@ -1524,6 +1549,7 @@ def do_regen_chapter(job, work):
                 prev_tail=prev_tail(work, ch["number"]) if work_mode(work) != "thread" else "",
                 number=ch["number"], title=ch["title"],
                 outline=rev_outline or ch["outline"],
+                forbidden=forbidden_scope_text(work, ch),
                 min_chars_note=min_chars_note(work)),
             max_tokens=body_max_tokens(),
             temperature=temperature(), progress=pw, body=True, phase=f"第{ch['number']}章 本文を生成中")
