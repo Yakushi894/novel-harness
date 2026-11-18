@@ -964,7 +964,7 @@ def design_prompt(work, chapter, intent, use_tail=True):
             prev_tail=prev_tail(work, chapter["number"]) if use_tail else "",
             source="", intent=intent),
         max_tokens=design_max_tokens(),
-        temperature=temperature(), phase="生成指示書を作成中")
+        temperature=temperature(), phase=f"第{chapter['number']}章 生成指示書を作成中")
     save_artifact(work, chapter, "prompt", f"ch{chapter['number']:03d}.txt", text)
     return text
 
@@ -1580,7 +1580,7 @@ def do_revise_outline(job, work):
                 number=ch["number"], title=ch["title"], outline=ch["outline"],
                 plan=plan_text, notes=notes),
             max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-            temperature=temperature(), phase="修正要綱を作成中")
+            temperature=temperature(), phase=f"第{ch['number']}章 修正概要を作成中")
     except llm.LoopDetectedError as e:
         save_loop_log(work, ch, "修正概要の作成", e)
         raise

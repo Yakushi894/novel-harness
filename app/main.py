@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.42"
+APP_VERSION = "1.43"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -577,9 +577,49 @@ def enqueue(work_id: int, kind: str, payload: dict | None = None):
            (work_id, kind, db.dumps(payload or {}), db.now(), db.now()))
 
 
+def _job_payload(j) -> dict:
+    try:
+        return json.loads(j["payload"] or "{}")
+    except (ValueError, TypeError):
+        return {}
+
+
+def _job_scope(j, by_id) -> str:
+    """ジョブの対象範囲の説明（第○章／第○〜○章／第○章以降／全章）。履歴表示用。"""
+    payload = _job_payload(j)
+    cid = payload.get("chapter_id")
+    if cid and cid in by_id:
+        return f"第{by_id[cid]['number']}章"
+    if j["kind"] == "range_generate":
+        lo, hi = payload.get("from"), payload.get("to")
+        if lo and hi:
+            return f"第{lo}〜{hi}章" + ("・作り直し" if payload.get("redo") else "")
+    if j["kind"] == "expand_plans" and payload.get("from_number"):
+        return f"第{payload['from_number']}章以降"
+    if j["kind"] in ("generate_chapters", "generate_thread", "revise_all",
+                     "expand_plans", "outline"):
+        return "全章"
+    return ""
+
+
+def _job_targets_chapter(j, ch) -> bool:
+    """そのジョブがその章を処理対象に含むか（再生成表記の判定用）。"""
+    payload = _job_payload(j)
+    if payload.get("chapter_id") == ch["id"]:
+        return True
+    if j["kind"] == "range_generate":
+        return int(payload.get("from") or 0) <= ch["number"] <= int(payload.get("to") or 0)
+    if j["kind"] == "expand_plans":
+        return ch["number"] >= max(int(payload.get("from_number") or 1), 1)
+    if j["kind"] in ("generate_chapters", "generate_thread", "revise_all"):
+        return ch["number"] >= 1
+    return False
+
+
 def _jobs_html(w, jobs) -> str:
     """作品ページのジョブ一覧フラグメント（ページ本体と live.json で共用）。"""
     now_ts = time.time()
+    by_id = {c["id"]: c for c in db.q("SELECT id, number FROM chapters WHERE work_id=?", (w["id"],))}
     rows = ""
     for j in jobs:
         if j["status"] == "running":
@@ -592,8 +632,10 @@ def _jobs_html(w, jobs) -> str:
             dur = f"（所要 {fmt_dur(j['updated_at'] - j['created_at'])}）"
         else:
             dur = ""
+        scope = _job_scope(j, by_id)
         rows += (
-            f"<div>#{j['id']} {esc(j['kind'])} ― {status_html(j['status'])} {dur} {esc(j['error'])}"
+            f"<div>#{j['id']} {esc(JOB_LABELS.get(j['kind'], j['kind']))}"
+            f"{('（' + scope + '）') if scope else ''} ― {status_html(j['status'])} {dur} {esc(j['error'])}"
             + (f" <form method='post' action='/jobs/{j['id']}/cancel' style='display:inline'><button>取消</button></form>"
                if j["status"] in ("queued", "running") else "") + "</div>"
             + usage_html(j))
@@ -661,6 +703,10 @@ def _current_work_html(w) -> str:
     j = active or jobs[0]
     ch = job_chapter(j)
     label = JOB_LABELS.get(j["kind"], j["kind"])
+    if j["kind"] == "range_generate":
+        scope = _job_scope(j, {c["id"]: c for c in chapters})
+        if scope:
+            label += f"（{scope}）"
     ch_note = f"第{ch['number']}章" if ch else ""
     if active:
         if active["status"] == "queued":
@@ -730,7 +776,9 @@ def _chapter_live_html(w, ch) -> str:
         return ""
     live_think = (f"<details><summary>Think（生成中・逐次）</summary><pre>{esc(partial_think)}</pre></details>"
                   if partial_think else "")
-    return (f"<div class='card' style='border:2px solid #e8b34b'><h2>生成中（逐次表示）</h2>"
+    regen = (pipeline.latest_artifact(w["id"], ch["id"], "final")
+             or pipeline.latest_artifact(w["id"], ch["id"], "draft"))
+    return (f"<div class='card' style='border:2px solid #e8b34b'><h2>生成中（逐次表示）{'※再生成' if regen else ''}</h2>"
             f"<p>本文 {len(partial_body):,}字 ／ Think {len(partial_think or ''):,}字"
             "（このページは自動更新されます。ブラウザを閉じても生成は続きます）</p>"
             f"<pre>{esc(partial_body)}</pre>{live_think}</div>")
@@ -742,12 +790,16 @@ CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "revise_outline": "
 CHAPTER_JOB_KINDS = tuple(CHAPTER_JOB_LABELS)
 
 
-def _chapter_jobs_html(jobs) -> str:
-    """章ページの再生成系ジョブ一覧フラグメント。"""
-    return "".join(
-        f"<div>#{j['id']} {CHAPTER_JOB_LABELS.get(j['kind'], j['kind'])} ― "
-        f"{status_html(j['status'])} {esc(j['error'])}</div>" + usage_html(j)
-        for j in jobs)
+def _chapter_jobs_html(jobs, by_id=None) -> str:
+    """章ページの再生成系ジョブ一覧フラグメント。対象章が分かるよう範囲も出す。"""
+    by_id = by_id or {}
+    out = ""
+    for j in jobs:
+        scope = _job_scope(j, by_id)
+        out += (f"<div>#{j['id']} {CHAPTER_JOB_LABELS.get(j['kind'], j['kind'])}"
+                f"{('（' + scope + '）') if scope else ''} ― "
+                f"{status_html(j['status'])} {esc(j['error'])}</div>" + usage_html(j))
+    return out
 
 
 @app.get("/works/{work_id}")
@@ -828,6 +880,8 @@ def work_detail(work_id: int):
     min_chars = int(w.get("min_chars") or 0)
     plan_pending = db.get_setting(f"plan_pending:{work_id}", "")
     max_ch_number = max((c["number"] for c in chapters), default=0)
+    active_jobs_w = db.q("SELECT * FROM jobs WHERE work_id=? AND status IN ('queued','running')",
+                         (work_id,))
     ch_html = ""
     for ch in chapters:
         chars = pipeline.chapter_chars(work_id, ch["id"])
@@ -836,8 +890,14 @@ def work_detail(work_id: int):
         plan_secs = pipeline.get_plan(w, ch)
         plan_block = ""
         if plan_secs:
+            p_active = any(
+                j["kind"] in ("regen_plan", "expand_plan_one", "expand_plans")
+                and _job_targets_chapter(j, ch) for j in active_jobs_w)
+            p_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
+                             "AND kind='plan'", (w["id"], ch["id"]))["c"]
+            p_mark = "（再生成中）" if p_active else ("（再生成済）" if p_count >= 2 else "")
             sec_html = "".join(
-                f"<details><summary>{esc(name)}</summary><pre>{esc(plan_secs[name])}</pre></details>"
+                f"<details><summary>{esc(name)}{p_mark}</summary><pre>{esc(plan_secs[name])}</pre></details>"
                 for name in pipeline.PLAN_SECTIONS if plan_secs.get(name))
             cascade_btn = ""
             if plan_pending == str(ch["number"]) and ch["number"] < max_ch_number:
@@ -1284,7 +1344,22 @@ def chapter_page(chapter_id: int):
                 "ORDER BY id DESC LIMIT 5",
                 (w["id"],) + CHAPTER_JOB_KINDS)
     active = any(j["status"] in ("queued", "running") for j in jobs)
-    job_html = _chapter_jobs_html(jobs)
+    job_html = _chapter_jobs_html(jobs, {c["id"]: c for c in chapters})
+
+    # 再生成の表記：既存の本文・計画があり、対象ジョブが動いている間は「再生成中」、
+    # 計画は再生成されたものなら「再生成済」を付ける。
+    active_jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND status IN ('queued','running')",
+                       (w["id"],))
+    body_regen = bool(draft or final) and any(
+        j["kind"] in ("regen_chapter", "range_generate", "generate_chapters",
+                      "generate_thread", "revise_all") and _job_targets_chapter(j, ch)
+        for j in active_jobs)
+    plan_regen_active = any(
+        j["kind"] in ("regen_plan", "expand_plan_one", "expand_plans")
+        and _job_targets_chapter(j, ch) for j in active_jobs)
+    plan_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
+                        "AND kind='plan'", (w["id"], ch["id"]))["c"]
+    plan_mark = "（再生成中）" if plan_regen_active else ("（再生成済）" if plan_count >= 2 else "")
 
     def _body_card(art, label, opened):
         if not art:
@@ -1294,8 +1369,9 @@ def chapter_page(chapter_id: int):
                 f"<summary>{label}（{len(text)}文字）</summary>"
                 f"<pre>{esc(text)}</pre></details>")
 
-    draft_html = _body_card(draft, "本文（1次出力）", opened=not final)
-    final_html = _body_card(final, "本文（2次修正）", opened=True)
+    regen_suffix = "※再生成" if body_regen else ""
+    draft_html = _body_card(draft, f"本文（1次出力）{regen_suffix}", opened=not final)
+    final_html = _body_card(final, f"本文（2次修正）{regen_suffix}", opened=True)
     if not draft and not final:
         draft_html = "<div class='card'><h2>本文</h2><p>まだ生成されていません。</p></div>"
     status_line = (f"<div class='card'><p>状態：<span id='ch-status-self'>{esc(ch['status'])}</span>"
@@ -1318,7 +1394,7 @@ def chapter_page(chapter_id: int):
                           f"<input type='hidden' name='chapter_id' value='{ch['id']}'>"
                           f"<button style='background:#2e7d32;border-color:#2e7d32'>OK：第{ch['number'] + 1}章以降を再生成（開始状態の引き継ぎを反映）</button></form>")
         plan_html = ("<div class='card'><h2>展開計画</h2>" + "".join(
-            f"<details><summary>{esc(name)}</summary><pre>{esc(plan_secs_ch[name])}</pre></details>"
+            f"<details><summary>{esc(name)}{plan_mark}</summary><pre>{esc(plan_secs_ch[name])}</pre></details>"
             for name in pipeline.PLAN_SECTIONS if plan_secs_ch.get(name))
             + f"""<form method='post' action='/chapters/{ch['id']}/plan_regen'>
             <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
@@ -1442,9 +1518,10 @@ def chapter_live(chapter_id: int):
                 (w["id"],) + CHAPTER_JOB_KINDS)
     active = (any(j["status"] in ("queued", "running") for j in jobs)
               or ch["status"] in ("generating", "revising"))
+    by_id = {c["id"]: c for c in db.q("SELECT id, number FROM chapters WHERE work_id=?", (w["id"],))}
     regions = {
         "dyn-live": _chapter_live_html(w, ch),
-        "dyn-jobs": _chapter_jobs_html(jobs),
+        "dyn-jobs": _chapter_jobs_html(jobs, by_id),
         "dyn-side": _sidebar_status(),
     }
     return JSONResponse({"reload": not active, "regions": regions,
