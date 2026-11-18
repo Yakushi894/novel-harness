@@ -283,6 +283,11 @@ def is_fanfic(work):
     return int(work.get("fanfic") or 0) == 1
 
 
+def is_continuation(work):
+    """続き作品：読み込んだ文書を便宜上すべて第1章とし、生成は第2章から始める。"""
+    return int(work.get("continuation") or 0) == 1
+
+
 def web_search_on(work):
     """全体設定とワークスペース別トグルの両方がONのときだけWeb検索する。"""
     if db.get_setting("web_search_enabled", "1") == "0":
@@ -564,8 +569,30 @@ def do_analyze(job, work):
         max_tokens=design_max_tokens(),
         temperature=temperature(), phase="初期状態（状態チェーン）を抽出中")
     save_artifact(work, None, "state", "state_initial.txt", state)
+    if is_continuation(work):
+        _register_first_chapter(work, state)
     set_stage(work["id"], "analyzed")
     notify(f"【小説ハーネス】「{work['title']}」の初期文書解析が完了しました。解析結果と現在の状態が以降の生成に反映されます。")
+
+
+def _register_first_chapter(work, state):
+    """続き作品：読み込んだ文書を便宜上すべて第1章として登録する。
+
+    アップロード済み文書（source 全部）を第1章の本文（著者の完成文なので
+    final として保存）し、解析で抽出した状態を第1章の終了状態として
+    状態チェーンに載せる。以後の生成は第2章から始まる。
+    """
+    srcs = db.q("SELECT * FROM artifacts WHERE work_id=? AND kind='source' ORDER BY id", (work["id"],))
+    if not srcs:
+        return
+    text = "\n\n".join(read_text(a["path"]) for a in srcs)
+    ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=1", (work["id"],))
+    if not ch:
+        cid = db.run("INSERT INTO chapters(work_id, number, title, outline, status) "
+                     "VALUES(?,1,'既存文書','','generated')", (work["id"],))
+        ch = db.one("SELECT * FROM chapters WHERE id=?", (cid,))
+    save_artifact(work, ch, "final", "ch001.txt", text)
+    save_artifact(work, ch, "state", "ch001_state.txt", state)
 
 
 _KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -936,23 +963,25 @@ def design_prompt(work, chapter, intent, use_tail=True):
     return text
 
 
-def do_generate_chapters(job, work):
-    """1次出力：現在ロード中のモデルで各章本文を生成する（API準拠）。"""
-    try:
-        run_term_check(work)
-    except Exception:
-        pass
-    chapters = db.q("SELECT * FROM chapters WHERE work_id=? AND status IN ('outlined','generated') ORDER BY number",
-                    (work["id"],))
+def _body_pass(job, work, chapters, thread=False):
+    """本文生成の共通ループ：渡された章のうち未生成（outlined）のものを順に生成する。
+
+    状態チェーンと要約まで更新する。推敲（2次修正・仕上げ）は行わない。
+    完了したら True、取消で中断したら False を返す。
+    """
+    label = "生成" if thread else "1次出力"
     for ch in chapters:
         if _cancelled(job):
-            return
+            return False
         if ch["status"] == "generated":
             continue
         set_chapter_status(ch["id"], "generating")
-        pw = progress_writer(work, ch, "1次出力")
+        pw = progress_writer(work, ch, label)
         try:
-            instruction = design_prompt(work, ch, work["request"]) + plan_instruction(work, ch)
+            if thread:
+                instruction = design_prompt(work, ch, work["request"], use_tail=False) + plan_instruction(work, ch)
+            else:
+                instruction = design_prompt(work, ch, work["request"]) + plan_instruction(work, ch)
             used_model = llm.current_model()
             prev_state = current_state(work, ch["number"])
             body = llm.chat(
@@ -962,7 +991,7 @@ def do_generate_chapters(job, work):
                     state=prev_state,
                     outlines=outlines_text(work),
                     summaries=summaries_text(work, ch["number"]),
-                    prev_tail=prev_tail(work, ch["number"]),
+                    prev_tail="" if thread else prev_tail(work, ch["number"]),
                     number=ch["number"], title=ch["title"], outline=ch["outline"],
                     min_chars_note=min_chars_note(work)),
                 max_tokens=body_max_tokens(),
@@ -981,7 +1010,7 @@ def do_generate_chapters(job, work):
             save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
             set_chapter_status(ch["id"], "generated")
         except llm.LoopDetectedError as e:
-            save_loop_log(work, ch, "1次出力", e)
+            save_loop_log(work, ch, label, e)
             clear_partial(work, ch)
             set_chapter_status(ch["id"], "outlined")
             raise
@@ -992,9 +1021,115 @@ def do_generate_chapters(job, work):
         except Exception:
             clear_partial(work, ch)
             raise
+    return True
+
+
+def do_generate_chapters(job, work):
+    """1次出力：現在ロード中のモデルで各章本文を生成する（API準拠）。"""
+    try:
+        run_term_check(work)
+    except Exception:
+        pass
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? AND status IN ('outlined','generated') ORDER BY number",
+                    (work["id"],))
+    if not _body_pass(job, work, chapters):
+        return
     set_stage(work["id"], "wait_model")
     notify(f"【小説ハーネス】「{work['title']}」の1次出力が終了しました（使用モデル：{llm.loaded_model()}）。"
            "2次修正に使うモデルへ切り替えて下さい。")
+
+
+def _prev_end_state_exists(work, number):
+    """number 章の生成に必要な前章（number-1）の終了状態（状態チェーン）があるか。"""
+    if number <= 1:
+        return True
+    prev = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?", (work["id"], number - 1))
+    if not prev:
+        return False
+    return bool(chapter_end_state(work, prev))
+
+
+def _range_one_outline(work, ch):
+    """範囲生成用：1章分の概要を新規作成（または作り直し）して chapters を更新する。"""
+    user = prompts.OUTLINE_RANGE_USER.format(
+        request=work["request"], settings=settings_text(work),
+        state=current_state(work, ch["number"]),
+        outlines=outlines_text(work), number=ch["number"])
+    text = llm.chat(
+        "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
+        max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
+        temperature=temperature(), phase=f"第{ch['number']}章 概要を作成中")
+    found = parse_outline_text(text)
+    picked = None
+    for num, title, body in found:
+        if int(num) == int(ch["number"]):
+            picked = (title, body)
+            break
+    if picked is None and found:
+        picked = (found[0][1], found[0][2])
+    if picked is None:
+        save_artifact(work, ch, "log", f"ch{ch['number']:03d}_outline_failed.txt", text)
+        raise RuntimeError("概要のパースに失敗しました（モデルの生出力を章の成果物ログに保存しました）")
+    db.run("UPDATE chapters SET title=?, outline=? WHERE id=?",
+           (picked[0].strip(), picked[1].strip(), ch["id"]))
+
+
+def do_range_generate(job, work):
+    """長編向け範囲生成：指定範囲の概要を1章ずつ作り、続けて本文（推敲なし）を作る。
+
+    一括概要生成と違い1章ずつ刻むので、10章を超える長編でも一発生成の
+    失敗（出力切れ・形式崩れ）が起きにくい。本文は1次出力までで止め、
+    推敲（2次修正・仕上げ）は従来のボタンを別に押す前提。
+    payload: {from, to, redo, analyze_first}
+    """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    lo = int(payload.get("from") or 1)
+    hi = int(payload.get("to") or lo)
+    redo = bool(payload.get("redo"))
+    try:
+        run_term_check(work)
+    except Exception:
+        pass
+    if payload.get("analyze_first") and is_continuation(work):
+        first = db.one("SELECT * FROM chapters WHERE work_id=? AND number=1", (work["id"],))
+        if not first:
+            do_analyze(job, work)
+            work = db.one("SELECT * FROM works WHERE id=?", (work["id"],)) or work
+    if lo >= 2 and not _prev_end_state_exists(work, lo):
+        raise RuntimeError(f"第{lo - 1}章の終了状態（キャラ表含む）がありません。"
+                           "先に前半の本文生成を完了してください")
+    # --- 概要を1章ずつ ---
+    for n in range(lo, hi + 1):
+        if _cancelled(job):
+            return
+        ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?", (work["id"], n))
+        if not ch:
+            cid = db.run("INSERT INTO chapters(work_id, number, title, outline, status) "
+                         "VALUES(?,?,'','','outlined')", (work["id"], n))
+            ch = db.one("SELECT * FROM chapters WHERE id=?", (cid,))
+        if redo or not (ch["outline"] or "").strip():
+            _range_one_outline(work, ch)
+    # --- 本文（推敲なし） ---
+    if redo:
+        db.run("UPDATE chapters SET status='outlined' WHERE work_id=? AND number BETWEEN ? AND ? AND status='generated'",
+               (work["id"], lo, hi))
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? AND number BETWEEN ? AND ? "
+                    "AND status IN ('outlined','generated') ORDER BY number",
+                    (work["id"], lo, hi))
+    thread = (work.get("mode") or "switch") == "thread"
+    if not _body_pass(job, work, chapters, thread=thread):
+        return
+    if thread:
+        set_stage(work["id"], "body_ready")
+        notify(f"【小説ハーネス】「{work['title']}」の範囲生成（第{lo}章〜第{hi}章）が終わりました（推敲なし）。"
+               "仕上げは「4. 仕上げ修正のみ」ボタンで実行してください。")
+    else:
+        set_stage(work["id"], "wait_model")
+        notify(f"【小説ハーネス】「{work['title']}」の範囲生成（第{lo}章〜第{hi}章）の1次出力が終わりました。"
+               "2次修正に使うモデルへ切り替えて下さい。")
 
 
 def revise_chapters(job, work, chapters, model_changed=False):
@@ -1051,8 +1186,15 @@ def do_generate_thread(job, work):
     """スレッドモード：モデル切替なし。章ごとに独立したコンテクスト（スレッド）で進行する。
 
     各章のスレッドには、アップロードしたTXT・設定資料・全章概要・前章までの要約・その章の概要だけを入れる。
-    他章の本文そのものは入れない（コンテクスト長節約）。生成→要約→同モデルで仕上げ修正まで一章ずつ完結させる。
+    他章の本文そのものは入れない（コンテクスト長節約）。生成→要約までで止めるのが
+    既定（推敲なし）。payload の finish=1 のときだけ、同モデルで仕上げ修正まで
+    一章ずつ完結させる（1回で監修まで進めない方針のため通常は使わない）。
     """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    finish = bool(payload.get("finish"))
     try:
         run_term_check(work)
     except Exception:
@@ -1107,8 +1249,13 @@ def do_generate_thread(job, work):
                 clear_partial(work, ch)
                 raise
             ch = dict(ch, status="generated")
-        if not revise_chapters(job, work, [ch]):
+        if finish and not revise_chapters(job, work, [ch]):
             return
+    if not finish:
+        set_stage(work["id"], "body_ready")
+        notify(f"【小説ハーネス】「{work['title']}」の本文生成が終わりました（推敲なし・モデル切替なし）。"
+               "仕上げ（監修）は「4. 仕上げ修正のみ」ボタンで実行してください。")
+        return
     set_stage(work["id"], "done")
     db.set_setting(f"work:{work['id']}:revise_model", str(llm.loaded_model() or ""))
     notify(f"【小説ハーネス】「{work['title']}」がスレッドモードで完成しました（使用モデル：{llm.loaded_model()}、モデル切替なし）。"
@@ -1477,6 +1624,7 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
             "expand_plans": do_expand_plans, "regen_plan": do_regen_plan,
             "expand_plan_one": do_expand_plan_one, "final_check": do_final_check,
+            "range_generate": do_range_generate,
             "revise_outline": do_revise_outline, "outline_chapter": do_outline_chapter}
 
 

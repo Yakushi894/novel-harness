@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.39"
+APP_VERSION = "1.40"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -46,6 +46,7 @@ STAGE_LABEL = {
     "outline_review": "2. 次章の内容（確認・修正待ち）",
     "plans_ready": "2.5 各章の展開計画作成済み",
     "generating": "3. 1次出力中",
+    "body_ready": "3. 本文生成済み（仕上げ待ち）",
     "wait_q4": "4. 2次修正（モデル切替待ち）",
     "wait_model": "4. 2次修正（モデル切替待ち）",
     "revising": "4. 2次修正中",
@@ -430,6 +431,7 @@ def index():
     <label><input type='radio' name='mode' value='thread'> スレッドモード（モデル切替なし・章ごとに別スレッドで完結）</label><br>
     <label><input type='radio' name='mode' value='single'> 単章モード（1章完結・指示を出しながら対話的に詰める）</label></div>
     <div class='row'><label><input type='checkbox' name='claude_ok' value='1'> Muse監修レーン可</label></div>
+    <div class='row'><label><input type='checkbox' name='continuation' value='1'> 続きを書く（読み込んだ文書を第1章として2章から開始・長編向け）</label></div>
     <button>作成</button></form></div>"""
     steps = "<p class='steps'>工程：" + " ⇒ ".join(FLOW_STEPS) + "</p>"
     return page("小説ハーネス", setup_banner() + steps + items + form + DROP_SCRIPT_INDEX)
@@ -438,16 +440,18 @@ def index():
 @app.post("/works")
 async def create_work(title: str = Form(...), request: str = Form(""), settings: str = Form(""),
                       num_chapters: int = Form(3), claude_ok: int = Form(0), mode: str = Form("switch"),
-                      min_chars: int = Form(0), source_file: UploadFile = File(None)):
+                      min_chars: int = Form(0), continuation: int = Form(0),
+                      source_file: UploadFile = File(None)):
     base = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower() or "work"
     if mode == "single":
         num_chapters = 1
     wid = db.run(
-        "INSERT INTO works(title, slug, request, settings, num_chapters, claude_ok, mode, min_chars, created_at, updated_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO works(title, slug, request, settings, num_chapters, claude_ok, mode, min_chars, continuation, created_at, updated_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (title, f"{base}-tmp", request, settings, num_chapters, claude_ok,
          mode if mode in ("switch", "thread", "single") else "switch",
-         min_chars if min_chars in MIN_CHARS_CHOICES else 0, db.now(), db.now()))
+         min_chars if min_chars in MIN_CHARS_CHOICES else 0, 1 if continuation else 0,
+         db.now(), db.now()))
     # slug は一意制約があるため、採番済みの id を含めて確定させる
     # （日本語タイトル同士を同秒に作ると base と時刻だけでは衝突する）。
     slug = f"{base}-{int(time.time()) % 1000000}-{wid}"
@@ -582,7 +586,8 @@ JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成
               "generate_thread": "章ごとスレッド生成", "revise_all": "2次修正",
               "regen_chapter": "本文の再生成", "revise_outline": "修正概要の作成",
               "outline_chapter": "概要の再生成", "search_term": "キャラクター検索",
-              "term_check": "用語チェック", "final_check": "最終チェック"}
+              "term_check": "用語チェック", "final_check": "最終チェック",
+              "range_generate": "範囲指定の生成（概要＋本文）"}
 
 
 def _peek_text(work, ch):
@@ -867,8 +872,8 @@ def work_detail(work_id: int):
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_chapters'><button>3. 1次出力（本文生成・現在ロード中のモデル）</button>{badge_gen}</form>"
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 2次修正（モデル切替を検知して自動実行）</button>{badge_rev}</form>")
     thread_buttons = (
-        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_thread'><button>3〜4. 章ごとスレッドで生成＋仕上げ（モデル切替なし・最初に選んだモデルのまま完結）</button>{badge_thread}</form>"
-        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 仕上げ修正のみ（生成済みの章を同モデルで修正）</button>{badge_rev_thread}</form>")
+        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_thread'><button>3. 本文生成（推敲なし・モデル切替なし）</button>{badge_thread}</form>"
+        f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 仕上げ修正（監修）のみ（生成済みの章を同モデルで修正）</button>{badge_rev_thread}</form>")
 
     single_html = ""
     if (w.get("mode") or "switch") == "single":
@@ -888,6 +893,23 @@ def work_detail(work_id: int):
     <h3>生成欄</h3>
     <div id='dyn-single'>{gen_inner}</div>
     </div>"""
+
+    range_html = ""
+    if (w.get("mode") or "switch") != "single":
+        _cont = pipeline.is_continuation(w)
+        _def = w["num_chapters"] or 3
+        _first_label = ("本文解析＋第1章終了時の状態解析をして、第2章" if _cont else "第1章")
+        range_html = f"""
+    <div class='card'><h2>長編向け：範囲指定で生成（概要＋本文・推敲なし）</h2>
+    <p>概要を1章ずつ作るので、10章を超える長編でも一括生成の失敗が起きにくい作りです。本文は1次出力（推敲なし）までで止まります。推敲（2次修正／仕上げ）は上の工程ボタンを別に押してください。</p>
+    <form method='post' action='/works/{w['id']}/range'>
+    <div class='row'>前半：{_first_label}〜第<input type='text' name='x' value='{_def}' style='width:4em'>章までの概要・本文を作成
+    <button name='range_mode' value='first'>前半を作成</button></div>
+    <div class='row'>後半：第<input type='text' name='x2' value='{_def}' style='width:4em'>章を境に、第<input type='text' name='X' value='{_def}' style='width:4em'>章まで
+    <button name='range_mode' value='cont'>この章から続きを作成（次の章から）</button>
+    <button name='range_mode' value='redo'>この章から作り直し</button></div>
+    </form>
+    <p>後半の実行には、開始章の前章の終了状態（キャラ表含む状態チェーン）が必要です。ない場合はお知らせに表示して実行しません。作り直しでは対象章の概要と本文を作り直します（旧本文は前版として自動で残ります）。</p></div>"""
 
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
     notice_html = ""
@@ -932,6 +954,7 @@ def work_detail(work_id: int):
     {single_html}
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p>
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='final_check'><button>6. 最終チェック（全章横断：文字数・繰り返し・登場・矛盾）</button>{badge_check}</form></div>
+    {range_html}
     <h2>章と概要</h2>{ch_html or '<p>まだ概要がありません。</p>'}
     <div class='card'><h2>ジョブ</h2><div id='dyn-jobs'>{job_html}</div></div>
     <div class='card'><h2>成果物</h2>{art_html or '<p>なし</p>'}</div>
@@ -945,6 +968,7 @@ def work_detail(work_id: int):
     <label><input type='radio' name='mode' value='switch' {'checked' if (w.get('mode') or 'switch') == 'switch' else ''}> 切替モード</label>
     <label><input type='radio' name='mode' value='thread' {'checked' if (w.get('mode') or 'switch') == 'thread' else ''}> スレッドモード（切替なし）</label>
     <label><input type='radio' name='mode' value='single' {'checked' if (w.get('mode') or 'switch') == 'single' else ''}> 単章モード（1章完結）</label></div>
+    <div class='row'><label><input type='checkbox' name='continuation' value='1' {'checked' if pipeline.is_continuation(w) else ''}> 続きを書く（読み込んだ文書を第1章として2章から開始・長編向け）</label></div>
     <button>保存</button></form></div>
     <div class='card'><h2>ワークスペースの削除</h2>
     <form method='post' action='/works/{w['id']}/delete' onsubmit="return confirm('このワークスペースを削除しますか？（作品データが消えます。用語DBは残ります）')">
@@ -1095,11 +1119,13 @@ def artifact_restore(artifact_id: int):
 
 @app.post("/works/{work_id}/meta")
 def work_meta(work_id: int, request: str = Form(""), settings: str = Form(""),
-              num_chapters: int = Form(3), mode: str = Form("switch"), min_chars: int = Form(0)):
-    db.run("UPDATE works SET request=?, settings=?, num_chapters=?, mode=?, min_chars=?, updated_at=? WHERE id=?",
+              num_chapters: int = Form(3), mode: str = Form("switch"), min_chars: int = Form(0),
+              continuation: int = Form(0)):
+    db.run("UPDATE works SET request=?, settings=?, num_chapters=?, mode=?, min_chars=?, continuation=?, updated_at=? WHERE id=?",
            (request, settings, 1 if mode == "single" else num_chapters,
             mode if mode in ("switch", "thread", "single") else "switch",
-            min_chars if min_chars in MIN_CHARS_CHOICES else 0, db.now(), work_id))
+            min_chars if min_chars in MIN_CHARS_CHOICES else 0, 1 if continuation else 0,
+            db.now(), work_id))
     return RedirectResponse(f"/works/{work_id}", status_code=303)
 
 
@@ -1124,6 +1150,49 @@ def work_job(work_id: int, kind: str = Form(...)):
         pipeline.set_stage(work_id, stage)
     enqueue(work_id, kind)
     return RedirectResponse(f"/works/{work_id}", status_code=303)
+
+
+@app.post("/works/{work_id}/range")
+def work_range(work_id: int, range_mode: str = Form(...),
+               x: int = Form(0), x2: int = Form(0), X: int = Form(0)):
+    """長編向け範囲生成の入口。前提（文書・前章終了状態）が無ければ
+    お知らせに「ありません」と出して実行しない。"""
+    w = db.one("SELECT * FROM works WHERE id=?", (work_id,))
+    if not w:
+        return PlainTextResponse("not found", status_code=404)
+    cont = pipeline.is_continuation(w)
+
+    def back():
+        return RedirectResponse(f"/works/{work_id}", status_code=303)
+
+    if range_mode == "first":
+        lo = 2 if cont else 1
+        hi = max(lo, int(x or 0))
+        if cont and not db.q("SELECT id FROM artifacts WHERE work_id=? AND kind='source'", (work_id,)):
+            pipeline.add_notice(w, "解析する文書がありません（ファイルがアップロードされていません）。"
+                                   "先に「1. 続き読み込み」で文書をアップロードしてください。")
+            return back()
+        payload = {"from": lo, "to": hi, "analyze_first": cont}
+    elif range_mode in ("cont", "redo"):
+        base = int(x2 or 0)
+        if base < 1:
+            pipeline.add_notice(w, "境の章番号を指定してください。")
+            return back()
+        if cont and range_mode == "redo" and base < 2:
+            pipeline.add_notice(w, "第1章は読み込んだ文書なので作り直しできません。第2章以降を指定してください。")
+            return back()
+        lo = base + 1 if range_mode == "cont" else base
+        hi = max(lo, int(X or 0))
+        if lo >= 2 and not pipeline._prev_end_state_exists(w, lo):
+            pipeline.add_notice(w, f"第{lo - 1}章の終了状態（キャラ表含む）がありません。"
+                                   "先に前半の本文生成を完了してください")
+            return back()
+        payload = {"from": lo, "to": hi, "redo": range_mode == "redo"}
+    else:
+        return PlainTextResponse("bad mode", status_code=400)
+    pipeline.set_stage(work_id, "outlining")
+    enqueue(work_id, "range_generate", payload)
+    return back()
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -1219,6 +1288,14 @@ def chapter_page(chapter_id: int):
                            f"<pre>{esc(out_state)}</pre></details>")
         state_html += "</details>"
 
+    prev_state_html = ""
+    if ch["number"] > 1:
+        prev_ch = next((c for c in chapters if c["number"] == ch["number"] - 1), None)
+        pstate = pipeline.chapter_end_state(w, prev_ch) if prev_ch else ""
+        if pstate:
+            prev_state_html = (f"<details class='card'><summary>前章（第{ch['number'] - 1}章）の終了状態（キャラ表含む）</summary>"
+                               f"<pre>{esc(pstate)}</pre></details>")
+
     rev_art = pipeline.latest_artifact(w["id"], ch["id"], "rev_outline")
     rev_notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
     rev_html = ""
@@ -1255,6 +1332,7 @@ def chapter_page(chapter_id: int):
     <form method='post' action='/chapters/{ch['id']}/regen' class='act'>
     <button>本文＋状態（再）生成</button>
     <span>本文に合わせて終了状態（状態チェーン）と要約も作り直します（従来の再生成）。</span></form></div>
+    {prev_state_html}
     {status_line}
     {draft_html}
     {final_html}
