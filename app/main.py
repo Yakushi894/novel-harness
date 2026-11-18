@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.46"
+APP_VERSION = "1.47"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -646,7 +646,8 @@ JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成
               "expand_plans": "各章を展開", "expand_plan_one": "展開計画の生成（この章のみ）",
               "regen_plan": "展開計画の再生成", "generate_chapters": "本文生成（1次出力）",
               "generate_thread": "章ごとスレッド生成", "revise_all": "2次修正",
-              "regen_chapter": "本文の再生成", "revise_outline": "修正概要の作成",
+              "regen_chapter": "本文の再生成", "regen_state": "終了状態の再生成",
+              "revise_outline": "修正概要の作成",
               "outline_chapter": "概要の再生成", "search_term": "キャラクター検索",
               "term_check": "用語チェック", "final_check": "最終チェック",
               "range_generate": "範囲指定の生成（概要＋本文）"}
@@ -791,7 +792,8 @@ def _chapter_live_html(w, ch) -> str:
             f"<pre>{esc(partial_body)}</pre>{live_think}</div>")
 
 
-CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "revise_outline": "修正概要の作成",
+CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "regen_state": "終了状態の再生成",
+                      "revise_outline": "修正概要の作成",
                       "expand_plan_one": "展開計画の生成（この章のみ）",
                       "outline_chapter": "概要の再生成"}
 CHAPTER_JOB_KINDS = tuple(CHAPTER_JOB_LABELS)
@@ -1459,7 +1461,10 @@ def chapter_page(chapter_id: int):
     <span>本文だけを作り直します。終了状態・要約は今のまま保持します（状態チェーンは変わりません）。</span></form>
     <form method='post' action='/chapters/{ch['id']}/regen' class='act'>
     <button>本文＋状態（再）生成</button>
-    <span>本文に合わせて終了状態（状態チェーン）と要約も作り直します（従来の再生成）。</span></form></div>
+    <span>本文に合わせて終了状態（状態チェーン）と要約も作り直します（従来の再生成）。</span></form>
+    <form method='post' action='/chapters/{ch['id']}/regen_state' class='act'>
+    <button>終了状態のみ（再）生成</button>
+    <span>今ある本文はそのままに、終了状態（状態チェーン）と要約だけを作り直します。状態の生成で止まってしまった場合の復旧用です（本文は書き直さないので短時間で済みます）。</span></form></div>
     {prev_state_html}
     {status_line}
     {draft_html}
@@ -1590,6 +1595,16 @@ def chapter_regen(chapter_id: int, notes: str = Form(""), with_state: str = Form
         return RedirectResponse("/", status_code=303)
     enqueue(ch["work_id"], "regen_chapter",
             {"chapter_id": chapter_id, "notes": notes, "with_state": with_state != "0"})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/regen_state")
+def chapter_regen_state(chapter_id: int):
+    """終了状態のみ再生成（本文はそのまま、状態と要約だけ作り直す復旧用）。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    enqueue(ch["work_id"], "regen_state", {"chapter_id": chapter_id})
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 

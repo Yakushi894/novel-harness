@@ -1082,6 +1082,12 @@ def _missing_state_message(work, number):
                 "先に「1. 続き読み込み」を実行して、文書の解析と終了状態の抽出をしてください。")
     prev = db.one("SELECT id FROM chapters WHERE work_id=? AND number=?", (work["id"], number))
     if prev:
+        has_body = (latest_artifact(work["id"], prev["id"], "final")
+                    or latest_artifact(work["id"], prev["id"], "draft"))
+        if has_body:
+            return (f"第{number}章の終了状態（キャラ表含む）がありません。"
+                    f"第{number}章の本文はあるので、章ページで「終了状態のみ（再）生成」を押して"
+                    f"終了状態を作ってください（本文から作り直す場合は「本文＋状態（再）生成」でも構いません）。")
         return (f"第{number}章の終了状態（キャラ表含む）がありません。"
                 f"第{number}章の章ページで「本文＋状態（再）生成」を押して、"
                 f"第{number}章の本文と終了状態を作ってください。")
@@ -1637,6 +1643,39 @@ def do_revise_outline(job, work):
            "章ページで確認し、よければ本文を再生成してください。")
 
 
+def do_regen_state(job, work):
+    """終了状態のみ再生成：既存の本文（final優先、なければdraft）はそのままに、
+    その章の終了状態（状態チェーン）と要約だけを作り直す。
+
+    状態の生成で変なところで止まって本文だけ残った場合の復旧用。
+    本文は書き直さないので、本文＋状態（再）生成より短時間で済む。
+    """
+    payload = json.loads(job["payload"] or "{}")
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (payload.get("chapter_id"),))
+    if not ch:
+        raise RuntimeError("対象の章が見つかりません")
+    art = (latest_artifact(work["id"], ch["id"], "final")
+           or latest_artifact(work["id"], ch["id"], "draft"))
+    if not art:
+        raise RuntimeError("本文がまだ生成されていません。先に本文を生成してください")
+    body = read_text(art["path"])
+    prev_state = current_state(work, ch["number"])
+    try:
+        update_state(work, ch, body, prev_state)
+        summary = llm.chat(
+            "auto", prompts.SUMMARY_SYSTEM,
+            prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
+            max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
+            temperature=temperature(), phase=f"第{ch['number']}章 要約を作成中")
+        save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
+    except llm.LoopDetectedError as e:
+        save_loop_log(work, ch, "終了状態の再生成", e)
+        raise
+    if ch["status"] == "outlined":
+        set_chapter_status(ch["id"], "generated")
+    return f"第{ch['number']}章の終了状態を再生成しました"
+
+
 def do_outline_chapter(job, work):
     """章ごとの概要再生成：指定した1章の概要だけを作り直して chapters を更新する。
 
@@ -1679,6 +1718,7 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "generate_chapters": do_generate_chapters, "revise_all": do_revise_all,
             "search_term": do_search_term, "term_check": do_term_check,
             "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
+            "regen_state": do_regen_state,
             "expand_plans": do_expand_plans, "regen_plan": do_regen_plan,
             "expand_plan_one": do_expand_plan_one, "final_check": do_final_check,
             "range_generate": do_range_generate,
