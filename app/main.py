@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.40"
+APP_VERSION = "1.41"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -269,6 +269,23 @@ POLL_SCRIPT = """
 """
 
 
+SIDEBAR_SCRIPT = """
+<script>
+(function(){
+  function tick(){
+    fetch('/sidebar.json').then(function(r){ return r.json(); }).then(function(j){
+      var el = document.getElementById('dyn-side');
+      var html = (j.regions || {})['dyn-side'];
+      if(el && html && el.innerHTML !== html) el.innerHTML = html;
+      setTimeout(tick, 10000);
+    }).catch(function(){ setTimeout(tick, 15000); });
+  }
+  setTimeout(tick, 10000);
+})();
+</script>
+"""
+
+
 def page(title: str, body: str, current_id=None, chapters=None, refresh: bool = False,
          live_url: str = None) -> HTMLResponse:
     if live_url:
@@ -276,7 +293,9 @@ def page(title: str, body: str, current_id=None, chapters=None, refresh: bool = 
     elif refresh:
         auto = "<script>setTimeout(function(){location.reload()},5000)</script>"
     else:
-        auto = ""
+        # 逐次更新のないページでも、サイドバーの状態（処理・Fill・GPU・最終更新）だけは
+        # 約10秒間隔で自動更新する。
+        auto = SIDEBAR_SCRIPT
     return HTMLResponse(
         "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -914,8 +933,8 @@ def work_detail(work_id: int):
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
     notice_html = ""
     if notices:
-        notice_html = ("<div class='card'><h2>お知らせ（用語DB）</h2>" + "".join(
-            f"<div>{esc(n['body'])}</div>" for n in notices) + "</div>")
+        notice_html = ("<h3 style='margin-top:1.2em'>お知らせ（用語DB）</h3>" + "".join(
+            f"<div>{esc(n['body'])}</div>" for n in notices))
 
     job_html = _jobs_html(w, jobs)
     art_html = "".join(
@@ -943,8 +962,7 @@ def work_detail(work_id: int):
     {analysis_html}
     {state_html}
     {search_html}
-    {notice_html}
-    <div class='card'><h2>現在の作業</h2><div id='dyn-current'>{_current_work_html(w)}</div></div>
+    <div class='card'><h2>現在の作業・お知らせ</h2><div id='dyn-current'>{_current_work_html(w)}</div>{notice_html}</div>
     <div class='card'><h2>工程の実行</h2>
     <p>モード：<b>{'単章モード（1章完結・対話的に詰める）' if (w.get('mode') or 'switch') == 'single' else ('スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）')}</b>（作品情報で変更できます）</p>
     {ws_html}
@@ -955,7 +973,12 @@ def work_detail(work_id: int):
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p>
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='final_check'><button>6. 最終チェック（全章横断：文字数・繰り返し・登場・矛盾）</button>{badge_check}</form></div>
     {range_html}
-    <h2>章と概要</h2>{ch_html or '<p>まだ概要がありません。</p>'}
+    <h2>章と概要</h2>
+    <form method='post' action='/works/{w['id']}/add_chapter' class='act'>
+    第<input type='text' name='number' value='{(max((c['number'] for c in chapters), default=0) + 1)}' style='width:4em'>章を追加する
+    <button>章を追加</button>
+    <span>空の章（章BOX）を追加します。概要は章ページで直接書くか、概要の再生成・範囲指定の生成で作れます。</span></form>
+    {ch_html or '<p>まだ概要がありません。</p>'}
     <div class='card'><h2>ジョブ</h2><div id='dyn-jobs'>{job_html}</div></div>
     <div class='card'><h2>成果物</h2>{art_html or '<p>なし</p>'}</div>
     <div class='card'><h2>作品情報</h2>
@@ -1195,6 +1218,25 @@ def work_range(work_id: int, range_mode: str = Form(...),
     return back()
 
 
+@app.post("/works/{work_id}/add_chapter")
+def work_add_chapter(work_id: int, number: int = Form(0)):
+    """章追加：空の章（章BOX）を1つ追加する。概要は章ページで書くか、
+    概要の再生成・範囲生成で作れる。既にある番号は追加できない。"""
+    w = db.one("SELECT * FROM works WHERE id=?", (work_id,))
+    if not w:
+        return PlainTextResponse("not found", status_code=404)
+    n = int(number or 0)
+    if n < 1:
+        pipeline.add_notice(w, "追加する章番号を指定してください。")
+        return RedirectResponse(f"/works/{work_id}", status_code=303)
+    if db.one("SELECT id FROM chapters WHERE work_id=? AND number=?", (work_id, n)):
+        pipeline.add_notice(w, f"第{n}章は既にあります。")
+        return RedirectResponse(f"/works/{work_id}", status_code=303)
+    db.run("INSERT INTO chapters(work_id, number, title, outline, status) "
+           "VALUES(?,?,'','','outlined')", (work_id, n))
+    return RedirectResponse(f"/works/{work_id}", status_code=303)
+
+
 @app.post("/jobs/{job_id}/cancel")
 def job_cancel(job_id: int):
     row = db.one("SELECT work_id FROM jobs WHERE id=?", (job_id,))
@@ -1353,6 +1395,12 @@ def chapter_page(chapter_id: int):
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
                 live_url=f"/chapters/{chapter_id}/live.json" if live_on else None)
+
+
+@app.get("/sidebar.json")
+def sidebar_json():
+    """サイドバーの状態フラグメントだけを返す（全ページ共通の約10秒間隔の自動更新用）。"""
+    return JSONResponse({"regions": {"dyn-side": _sidebar_status()}})
 
 
 @app.get("/works/{work_id}/live.json")
