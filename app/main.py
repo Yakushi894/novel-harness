@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.44"
+APP_VERSION = "1.45"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -653,20 +653,23 @@ JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成
 
 
 def _peek_text(work, ch):
-    """止まった場所のちら見せ用テキスト（生成途中→異常終了ログ→保存済み本文の順）。"""
+    """止まった場所のちら見せ用テキスト（生成途中→異常終了ログ→保存済み本文の順）。
+
+    戻り値は (ラベル, 本文, 異常終了ログの成果物ID or None)。
+    """
     if ch is None:
-        return "", ""
+        return "", "", None
     body, _t = pipeline.read_partial(work, ch)
     if body:
-        return "生成途中の本文（末尾）", body
+        return "生成途中の本文（末尾）", body, None
     log = pipeline.latest_artifact(work["id"], ch["id"], "log")
     if log:
-        return "異常終了時の出力（末尾）", pipeline.read_text(log["path"])
+        return "異常終了時の出力（末尾）", pipeline.read_text(log["path"]), log["id"]
     art = (pipeline.latest_artifact(work["id"], ch["id"], "final")
            or pipeline.latest_artifact(work["id"], ch["id"], "draft"))
     if art:
-        return "保存済みの本文（末尾）", pipeline.read_text(art["path"])
-    return "", ""
+        return "保存済みの本文（末尾）", pipeline.read_text(art["path"]), None
+    return "", "", None
 
 
 def _current_work_html(w) -> str:
@@ -691,12 +694,16 @@ def _current_work_html(w) -> str:
         return None
 
     def peek_html(j, ch):
-        label, text = _peek_text(w, ch)
+        label, text, log_id = _peek_text(w, ch)
         if not text:
             return ""
         tail = text[-1200:]
         note = "（末尾1,200字を表示）" if len(text) > 1200 else ""
-        return (f"<p style='margin:.6em 0 .3em'>{esc(label)}{note}</p>"
+        del_btn = ""
+        if log_id:
+            del_btn = (f" <form method='post' action='/artifacts/{log_id}/delete' style='display:inline'>"
+                       "<button>この異常終了ログを削除</button></form>")
+        return (f"<p style='margin:.6em 0 .3em'>{esc(label)}{note}{del_btn}</p>"
                 f"<pre style='max-height:15em;overflow:auto'>{esc(tail)}</pre>")
 
     active = next((j for j in jobs if j["status"] in ("queued", "running")), None)
@@ -1378,8 +1385,8 @@ def chapter_page(chapter_id: int):
     think_html = (f"<details class='card'><summary>Think（思考過程）</summary>"
                   f"<pre>{esc(pipeline.read_text(think['path']))}</pre></details>") if think else ""
     live_html = _chapter_live_html(w, ch)
-    loop_log_html = (f"<div class='card' style='border:2px solid #b03a3a'><h2>異常終了ログ（生成ループ）</h2>"
-                     f"<pre>{esc(pipeline.read_text(loop_log['path']))}</pre></div>") if loop_log else ""
+    loop_log_html = (f"<details class='card' style='border:2px solid #b03a3a'><summary>異常終了ログ（生成ループ）</summary>"
+                     f"<pre>{esc(pipeline.read_text(loop_log['path']))}</pre></details>") if loop_log else ""
     design_html = (f"<details class='card'><summary>生成指示書</summary>"
                    f"<pre>{esc(pipeline.read_text(design['path']))}</pre></details>") if design else ""
     plan_secs_ch = pipeline.get_plan(w, ch)
