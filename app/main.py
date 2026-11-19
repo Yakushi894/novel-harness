@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.54"
+APP_VERSION = "1.55"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -489,7 +489,6 @@ def index():
     <label><input type='radio' name='mode' value='switch' checked> 切替モード（1次出力→モデル切替→2次修正）</label><br>
     <label><input type='radio' name='mode' value='thread'> スレッドモード（モデル切替なし・章ごとに別スレッドで完結）</label><br>
     <label><input type='radio' name='mode' value='single'> 単章モード（1章完結・指示を出しながら対話的に詰める）</label></div>
-    <div class='row'><label><input type='checkbox' name='claude_ok' value='1'> Muse監修レーン可</label></div>
     <div class='row'><label><input type='checkbox' name='continuation' value='1'> 続きを書く（長編向け）</label></div>
     <div class='row' style='color:#c0392b;font-weight:700'>※「続きを書く」の場合、読み込んだ文書は「第0章」として読み込まれます。新しい本文の生成は第1章から始まります。</div>
     <button>作成</button></form></div>"""
@@ -499,16 +498,16 @@ def index():
 
 @app.post("/works")
 async def create_work(title: str = Form(...), request: str = Form(""), settings: str = Form(""),
-                      num_chapters: int = Form(3), claude_ok: int = Form(0), mode: str = Form("switch"),
+                      num_chapters: int = Form(3), mode: str = Form("switch"),
                       min_chars: int = Form(0), continuation: int = Form(0),
                       source_file: UploadFile = File(None)):
     base = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower() or "work"
     if mode == "single":
         num_chapters = 1
     wid = db.run(
-        "INSERT INTO works(title, slug, request, settings, num_chapters, claude_ok, mode, min_chars, continuation, created_at, updated_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (title, f"{base}-tmp", request, settings, num_chapters, claude_ok,
+        "INSERT INTO works(title, slug, request, settings, num_chapters, mode, min_chars, continuation, created_at, updated_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (title, f"{base}-tmp", request, settings, num_chapters,
          mode if mode in ("switch", "thread", "single") else "switch",
          min_chars if min_chars in MIN_CHARS_CHOICES else 0, 1 if continuation else 0,
          db.now(), db.now()))

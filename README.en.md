@@ -136,4 +136,3 @@ The output page is a formatted reading page (serif type, table of contents, hori
 - Strata-family servers have **no model-switching API** (only `POST /load` / `POST /unload`). The revision pass is therefore "notify + manual switch + automatic detection" by design.
 - Thinking tokens count toward the output cap (see the token policy in the GUI section).
 - The UI is for LAN / Tailscale access only. Do not expose it to the internet.
-- Review by Muse is an opt-in lane: only works you explicitly mark as "Muse review OK" are ever sent; everything else never leaves the local network.
