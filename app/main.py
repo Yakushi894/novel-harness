@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.59"
+APP_VERSION = "1.60"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -232,6 +232,38 @@ def _sidebar_status() -> str:
         return html + "</div>"
     except Exception:
         return ""
+
+
+_PLAN_STATE_STYLE = {
+    "未生成": "#888",
+    "生成中": "#b97d1a",
+    "生成済み": "#1a7f37",
+    "再生成中": "#2471a3",
+    "再生成済み": "#7d3c98",
+}
+
+
+def _plan_sections_html(sections, active, plan_count):
+    """展開計画の節一覧を、節ごとの状態チップ付きで描く。
+
+    状態は 未生成（内容なし）⇒ 生成中（実行中・内容なし）⇒ 生成済み
+    （内容あり・初版）⇒ 再生成中（実行中・内容あり）⇒ 再生成済み
+    （内容あり・2版目以降）の順に遷移する。計画は1回の生成で全節が
+    まとめて作られるため、状態は節ではなく計画単位で決まる。
+    """
+    out = ""
+    for name in pipeline.PLAN_SECTIONS:
+        body = (sections or {}).get(name) or ""
+        if body:
+            state = "再生成中" if active else ("再生成済み" if plan_count >= 2 else "生成済み")
+        else:
+            state = "生成中" if active else "未生成"
+        chip = (f" <span style='color:{_PLAN_STATE_STYLE[state]};font-weight:700'>"
+                f"（{state}）</span>")
+        inner = (f"<pre>{esc(body)}</pre>" if body
+                 else "<p class='muted'>まだ生成されていません。</p>")
+        out += f"<details><summary>{esc(name)}{chip}</summary>{inner}</details>"
+    return out
 
 
 def _short_title(t, n=10):
@@ -942,17 +974,15 @@ def work_detail(work_id: int):
         chars_note = (f"<div class='row'>本文：{chars}文字"
                       + (f"（最低{min_chars}文字）" if min_chars > 0 else "") + "</div>") if chars else ""
         plan_secs = pipeline.get_plan(w, ch)
-        plan_block = ""
+        p_active = any(
+            j["kind"] in ("regen_plan", "expand_plan_one", "expand_plans")
+            and _job_targets_chapter(j, ch) for j in active_jobs_w)
+        p_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
+                         "AND kind='plan'", (w["id"], ch["id"]))["c"]
+        sec_html = _plan_sections_html(plan_secs, p_active, p_count)
+        plan_block = (f"<details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>"
+                      f"{sec_html}</details>")
         if plan_secs:
-            p_active = any(
-                j["kind"] in ("regen_plan", "expand_plan_one", "expand_plans")
-                and _job_targets_chapter(j, ch) for j in active_jobs_w)
-            p_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
-                             "AND kind='plan'", (w["id"], ch["id"]))["c"]
-            p_mark = "（再生成中）" if p_active else ("（再生成済）" if p_count >= 2 else "")
-            sec_html = "".join(
-                f"<details><summary>{esc(name)}{p_mark}</summary><pre>{esc(plan_secs[name])}</pre></details>"
-                for name in pipeline.PLAN_SECTIONS if plan_secs.get(name))
             cascade_btn = ""
             if plan_pending == str(ch["number"]) and ch["number"] < max_ch_number:
                 cascade_btn = (f"<form method='post' action='/works/{w['id']}/plan_cascade' style='margin-top:.5em'>"
@@ -962,7 +992,7 @@ def work_detail(work_id: int):
         <form method='post' action='/chapters/{ch['id']}/plan_regen'>
         <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
         <button>追加指定を考慮して再生成</button></form>{cascade_btn}
-        <details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>{sec_html}</details>"""
+        """ + plan_block
         design_art = pipeline.latest_artifact(w["id"], ch["id"], "prompt")
         design_block = ""
         if design_art:
@@ -1412,8 +1442,8 @@ def chapter_page(chapter_id: int):
     active = any(j["status"] in ("queued", "running") for j in jobs)
     job_html = _chapter_jobs_html(jobs, {c["id"]: c for c in chapters})
 
-    # 再生成の表記：既存の本文・計画があり、対象ジョブが動いている間は「再生成中」、
-    # 計画は再生成されたものなら「再生成済」を付ける。
+    # 再生成の表記：既存の本文・計画があり、対象ジョブが動いている間は「再生成中」。
+    # 計画の節ごとの状態チップは _plan_sections_html が付ける。
     active_jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND status IN ('queued','running')",
                        (w["id"],))
     body_regen = bool(draft or final) and any(
@@ -1425,7 +1455,6 @@ def chapter_page(chapter_id: int):
         and _job_targets_chapter(j, ch) for j in active_jobs)
     plan_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
                         "AND kind='plan'", (w["id"], ch["id"]))["c"]
-    plan_mark = "（再生成中）" if plan_regen_active else ("（再生成済）" if plan_count >= 2 else "")
 
     def _body_card(art, label, opened):
         if not art:
@@ -1450,7 +1479,8 @@ def chapter_page(chapter_id: int):
     design_html = (f"<details class='card'><summary>生成指示書</summary>"
                    f"<pre>{esc(pipeline.read_text(design['path']))}</pre></details>") if design else ""
     plan_secs_ch = pipeline.get_plan(w, ch)
-    plan_html = ""
+    plan_html = ("<div class='card'><h2>展開計画</h2>"
+                 + _plan_sections_html(plan_secs_ch, plan_regen_active, plan_count))
     if plan_secs_ch:
         pending_ch = db.get_setting(f"plan_pending:{w['id']}", "")
         max_num_ch = db.one("SELECT MAX(number) AS m FROM chapters WHERE work_id=?", (w["id"],))["m"] or 0
@@ -1459,12 +1489,10 @@ def chapter_page(chapter_id: int):
             cascade_ch = (f"<form method='post' action='/works/{w['id']}/plan_cascade'>"
                           f"<input type='hidden' name='chapter_id' value='{ch['id']}'>"
                           f"<button style='background:#2e7d32;border-color:#2e7d32'>OK：第{ch['number'] + 1}章以降を再生成（開始状態の引き継ぎを反映）</button></form>")
-        plan_html = ("<div class='card'><h2>展開計画</h2>" + "".join(
-            f"<details><summary>{esc(name)}{plan_mark}</summary><pre>{esc(plan_secs_ch[name])}</pre></details>"
-            for name in pipeline.PLAN_SECTIONS if plan_secs_ch.get(name))
-            + f"""<form method='post' action='/chapters/{ch['id']}/plan_regen'>
+        plan_html += (f"""<form method='post' action='/chapters/{ch['id']}/plan_regen'>
             <div class='row'>展開計画への追加指定（内容詳細・終了状態・次章開始状態を作り直します）<textarea name='notes' rows='2'></textarea></div>
-            <button>追加指定を考慮して再生成</button></form>{cascade_ch}</div>""")
+            <button>追加指定を考慮して再生成</button></form>{cascade_ch}""")
+    plan_html += "</div>"
     state_html = ""
     if in_state or out_state:
         state_html = "<details class='card'><summary>状態（状態チェーン）</summary>"
