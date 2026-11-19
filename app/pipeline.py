@@ -680,10 +680,29 @@ def do_outline(job, work):
             raise RuntimeError("概要のパースに失敗しました（自動リトライ1回でも読み取れず。モデルの生出力を成果物のログに保存しました）")
     if (work.get("mode") or "switch") == "single":
         found = [(1, found[0][1], found[0][2])]  # 単章モードは最初の1章だけに絞る
-    db.run("DELETE FROM chapters WHERE work_id=? AND number>=1", (work["id"],))
+    # 章番号を正規化する：モデルが目次と本編で同じ章を二重に出したり第0章を
+    # 混ぜたりすると、そのまま INSERT すると UNIQUE 制約で落ちて、長時間の
+    # 生成結果ごと失われる。同番号は本文の長い方を残し、第0章以下は捨てる。
+    by_num = {}
     for num, title, body in found:
-        db.run("INSERT INTO chapters(work_id, number, title, outline, status) VALUES(?,?,?,?,'outlined')",
-               (work["id"], int(num), title.strip(), body.strip()))
+        n = int(num)
+        if n < 1:
+            continue
+        if n not in by_num or len(body) > len(by_num[n][1]):
+            by_num[n] = (title, body)
+    if not by_num:
+        save_artifact(work, None, "log", "outline_failed.txt", text)
+        raise RuntimeError("概要のパースに失敗しました（第1章以降の章が読み取れず。モデルの生出力を成果物のログに保存しました）")
+    try:
+        db.run("DELETE FROM chapters WHERE work_id=? AND number>=1", (work["id"],))
+        for n in sorted(by_num):
+            title, body = by_num[n]
+            db.run("INSERT INTO chapters(work_id, number, title, outline, status) VALUES(?,?,?,?,'outlined')",
+                   (work["id"], n, title.strip(), body.strip()))
+    except Exception:
+        # 保存に失敗しても生成結果はログに残す（再実行の参考・救済用）
+        save_artifact(work, None, "log", "outline_failed.txt", text)
+        raise
     set_stage(work["id"], "outline_review")
     notify(f"【小説ハーネス】「{work['title']}」の各章概要（次章の内容）ができました。確認と修正をお願いします。")
 
