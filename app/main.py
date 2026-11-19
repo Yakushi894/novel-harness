@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.51"
+APP_VERSION = "1.52"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -152,6 +152,16 @@ def _phase_text(work_id) -> str:
     return f"処理：{label}" + (f"・{state}" if state else "") + elapsed
 
 
+def _loaded_model_html() -> str:
+    """ロード中モデルの表示。推論サーバーに届かない場合は「接続が切れています」と出す。"""
+    m = llm.loaded_model()
+    if m is None:
+        return "<span style='color:#e86a6a;font-weight:600'>接続が切れています</span>"
+    if m == "":
+        return "（モデル未ロード）"
+    return esc(m)
+
+
 def _sidebar_status() -> str:
     """サイドバー下部：直近の呼び出しのコンテキスト Fill と処理速度、生成中の逐次状態。"""
     try:
@@ -227,7 +237,7 @@ def sidebar(current_id=None, chapters=None) -> str:
         "<div class='side-sec'>ワークスペース</div>"
         + (items or "<div class='ws-item'>まだありません</div>")
         + "<div class='side-foot'>"
-        f"<div>ロード中モデル：{esc(llm.loaded_model())}</div>"
+        f"<div>ロード中モデル：{_loaded_model_html()}</div>"
         + f"<div id='dyn-side'>{_sidebar_status()}</div>"
         + "<div style='margin-top:.4em'><a href='/glossary'>📖 用語DB</a> ｜ <a href='/settings'>⚙ 設定</a></div>"
         "</div></div>")
@@ -748,7 +758,7 @@ def _work_head_html(w) -> str:
     revise_model = db.get_setting(f"work:{w['id']}:revise_model", "")
     return (f"<p>状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}</p>"
             f"<p class='steps'>工程：{' ⇒ '.join(FLOW_STEPS)}</p>"
-            f"<p>ロード中モデル：{esc(llm.loaded_model())}"
+            f"<p>ロード中モデル：{_loaded_model_html()}"
             f" ／ 1次出力モデル：{esc(draft_model) or '―'} ／ 2次修正モデル：{esc(revise_model) or '―'}</p>")
 
 
@@ -1746,8 +1756,14 @@ def settings_form():
     cur_url = db.get_setting("strata_base_url", "") or llm.ENV_BASE_URL
     has_key = bool(db.get_setting("strata_api_key", "") or llm.ENV_API_KEY)
     loaded = llm.loaded_model()
-    conn = ("接続OK（ロード中モデル：" + esc(loaded) + "）") if loaded else \
-        ("モックモード" if llm.MOCK else "未接続（URL未設定、またはサーバーに届いていません）")
+    if llm.MOCK:
+        conn = "モックモード"
+    elif loaded is None:
+        conn = "接続が切れています（URL未設定、またはサーバーに届いていません）"
+    elif loaded == "":
+        conn = "接続OK（モデル未ロード）"
+    else:
+        conn = "接続OK（ロード中モデル：" + esc(loaded) + "）"
     def _ctx_opts(cur):
         presets = [65536, 131072, 262144, 524288]
         if cur not in presets:

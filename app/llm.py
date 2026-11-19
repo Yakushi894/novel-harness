@@ -274,21 +274,31 @@ def _report_usage(j, max_tokens, req_chars=0):
         pass
 
 
+_MODEL_CACHE = {"at": 0.0, "value": None}
+
+
 def loaded_model():
-    """現在ロードされているモデルIDを返す。サーバーに届かない場合は None。"""
+    """現在ロードされているモデルIDを返す。サーバーに届かない場合は None、
+    届くがモデル未ロードの場合は ""。
+    結果は10秒キャッシュし、確認のタイムアウトも2秒に絞る。推論サーバーが
+    落ちているときに、画面表示のたびに接続待ちで固まらないようにするため。"""
     if MOCK:
         return os.environ.get("MOCK_LOADED_MODEL", "mock-q3")
     if not base_url():
         return None
+    now = time.time()
+    if now - _MODEL_CACHE["at"] < 10:
+        return _MODEL_CACHE["value"]
+    value = None
     try:
-        r = httpx.get(f"{base_url()}/v1/models", headers=_headers(), timeout=10)
+        r = httpx.get(f"{base_url()}/v1/models", headers=_headers(), timeout=2)
         r.raise_for_status()
         data = r.json().get("data", [])
-        if data:
-            return str(data[0].get("id", ""))
-        return ""
+        value = str(data[0].get("id", "")) if data else ""
     except Exception:
-        return None
+        value = None
+    _MODEL_CACHE.update(at=now, value=value)
+    return value
 
 
 def current_model():
