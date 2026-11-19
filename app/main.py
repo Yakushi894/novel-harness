@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.52"
+APP_VERSION = "1.53"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -162,9 +162,22 @@ def _loaded_model_html() -> str:
     return esc(m)
 
 
+def _age_text(age: int) -> str:
+    if age < 120:
+        return f"{age}秒前"
+    if age < 3600:
+        return f"{age // 60}分前"
+    if age < 86400:
+        return f"{age // 3600}時間前"
+    return f"{age // 86400}日前"
+
+
 def _sidebar_status() -> str:
-    """サイドバー下部：直近の呼び出しのコンテキスト Fill と処理速度、生成中の逐次状態。"""
+    """サイドバー下部：直近の呼び出しのコンテキスト Fill と処理速度、生成中の逐次状態。
+    最後の呼び出しから30分以上経ち、実行中のジョブも無い場合は、Fill と速度の
+    数値（前回の残り）を現在値のように見せないため出さず、最終更新だけを出す。"""
     try:
+        import time as _time
         pt = int(db.get_setting("live:prompt_tokens", "") or 0)
         ct = int(db.get_setting("live:completion_tokens", "") or 0)
         ctx = pipeline.ctx_window()
@@ -177,13 +190,23 @@ def _sidebar_status() -> str:
             ph = _phase_text(run["work_id"])
             if ph:
                 html += f"<div style='color:#7fd4a8;font-weight:600;margin-bottom:.3em'>{esc(ph)}</div>"
-        html += (
-            f"<div>コンテキスト Fill：{fill}%（{(pt + ct):,} / {ctx:,} tok）</div>"
-            f"<div style='background:#333;height:6px;border-radius:3px;margin:.2em 0'>"
-            f"<div style='background:#e8862e;height:6px;border-radius:3px;width:{fill}%'></div></div>"
-            f"<div>GPU プリフィル：{_fmt_tps(pre)} tok/s</div>"
-            f"<div>GPU デコード：{_fmt_tps(dec)} tok/s</div>")
-        import time as _time
+        last = 0.0
+        for key in ("live:call_at", "live:at"):
+            v = db.get_setting(key, "")
+            if v:
+                try:
+                    last = max(last, float(v))
+                except ValueError:
+                    pass
+        age = max(0, int(_time.time() - last)) if last else None
+        stale = run is None and (age is None or age >= 1800)
+        if not stale:
+            html += (
+                f"<div>コンテキスト Fill：{fill}%（{(pt + ct):,} / {ctx:,} tok）</div>"
+                f"<div style='background:#333;height:6px;border-radius:3px;margin:.2em 0'>"
+                f"<div style='background:#e8862e;height:6px;border-radius:3px;width:{fill}%'></div></div>"
+                f"<div>GPU プリフィル：{_fmt_tps(pre)} tok/s</div>"
+                f"<div>GPU デコード：{_fmt_tps(dec)} tok/s</div>")
         at = db.get_setting("live:at", "")
         if at and _time.time() - float(at) < 180 and db.get_setting("live:label", ""):
             html += (
@@ -191,14 +214,8 @@ def _sidebar_status() -> str:
                 f"（{esc(db.get_setting('live:label', ''))}）<br>"
                 f"本文 {int(db.get_setting('live:body_chars', '') or 0):,}字 ／ "
                 f"Think {int(db.get_setting('live:think_chars', '') or 0):,}字</div>")
-        call_at = db.get_setting("live:call_at", "")
-        if call_at:
-            try:
-                age = max(0, int(_time.time() - float(call_at)))
-                html += (f"<div class='muted'>最終更新：{age}秒前</div>" if age < 120
-                         else f"<div class='muted'>最終更新：{age // 60}分前</div>")
-            except ValueError:
-                pass
+        if age is not None:
+            html += f"<div class='muted'>最終更新：{_age_text(age)}</div>"
         return html + "</div>"
     except Exception:
         return ""
