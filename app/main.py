@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.57"
+APP_VERSION = "1.58"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -234,6 +234,12 @@ def _sidebar_status() -> str:
         return ""
 
 
+def _short_title(t, n=10):
+    """サイドバー用の章タイトル短縮：n文字を超えたら先頭n文字＋「・・・・」にする。"""
+    t = t or ""
+    return t[:n] + "・・・・" if len(t) > n else t
+
+
 def sidebar(current_id=None, chapters=None) -> str:
     try:
         works = db.q("SELECT * FROM works ORDER BY id DESC")
@@ -255,7 +261,7 @@ def sidebar(current_id=None, chapters=None) -> str:
                     chs = []
             for c in chs:
                 items += (
-                    f"<div class='ch-item'><a href='/chapters/{c['id']}'>第{c['number']}章 {esc(c['title'])}"
+                    f"<div class='ch-item'><a href='/chapters/{c['id']}' title='{esc(c['title'])}'>第{c['number']}章 {esc(_short_title(c['title']))}"
                     f"（{esc(c['status'])}）</a>"
                     f"<form method='post' action='/chapters/{c['id']}/delete' "
                     "onsubmit=\"return confirm('この章を削除しますか？（本文・概要も消えます）')\" style='margin:0'>"
