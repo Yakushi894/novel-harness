@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.56"
+APP_VERSION = "1.57"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -977,14 +977,18 @@ def work_detail(work_id: int):
         <button style='background:#b03a3a;border-color:#b03a3a'>この章を削除</button></form></div>"""
 
     # 工程の「✔ 終了済み」バッジ：直近ジョブの完了、または成果物の揃い具合で判定
+    # 直近ジョブが失敗した工程は、成果物が揃っていても「✖ エラー終了」を優先表示する
     _seen_kind = set()
     _job_done = set()
+    _job_failed = set()
     for j in db.q("SELECT kind, status FROM jobs WHERE work_id=? ORDER BY id DESC", (work_id,)):
         if j["kind"] in _seen_kind:
             continue
         _seen_kind.add(j["kind"])
         if j["status"] == "done":
             _job_done.add(j["kind"])
+        elif j["status"] == "failed":
+            _job_failed.add(j["kind"])
     _all_ch = {c["id"] for c in chapters}
     _plan_ch = {a["chapter_id"] for a in arts if a["kind"] == "plan"}
     _body_ch = {a["chapter_id"] for a in arts if a["kind"] in ("draft", "final")}
@@ -993,13 +997,18 @@ def work_detail(work_id: int):
     def _badge(done):
         return " <span style='color:#1a7f37;font-weight:700'>✔ 終了済み</span>" if done else ""
 
-    badge_outline = _badge(bool(chapters) or "outline" in _job_done)
-    badge_expand = _badge((bool(_all_ch) and _all_ch <= _plan_ch) or "expand_plans" in _job_done)
-    badge_gen = _badge((bool(_all_ch) and _all_ch <= _body_ch) or "generate_chapters" in _job_done)
-    badge_rev = _badge((bool(_all_ch) and _all_ch <= _final_ch) or "revise_all" in _job_done)
-    badge_thread = _badge((bool(_all_ch) and _all_ch <= _final_ch) or "generate_thread" in _job_done)
-    badge_rev_thread = _badge("revise_all" in _job_done)
-    badge_check = _badge("final_check" in _job_done or any(a["kind"] == "check" for a in arts))
+    def _badge_f(done, kind):
+        if kind in _job_failed:
+            return " <span style='color:#b03a3a;font-weight:700'>✖ エラー終了</span>"
+        return _badge(done)
+
+    badge_outline = _badge_f(bool(chapters) or "outline" in _job_done, "outline")
+    badge_expand = _badge_f((bool(_all_ch) and _all_ch <= _plan_ch) or "expand_plans" in _job_done, "expand_plans")
+    badge_gen = _badge_f((bool(_all_ch) and _all_ch <= _body_ch) or "generate_chapters" in _job_done, "generate_chapters")
+    badge_rev = _badge_f((bool(_all_ch) and _all_ch <= _final_ch) or "revise_all" in _job_done, "revise_all")
+    badge_thread = _badge_f((bool(_all_ch) and _all_ch <= _final_ch) or "generate_thread" in _job_done, "generate_thread")
+    badge_rev_thread = _badge_f("revise_all" in _job_done, "revise_all")
+    badge_check = _badge_f("final_check" in _job_done or any(a["kind"] == "check" for a in arts), "final_check")
 
     switch_buttons = (
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_chapters'><button>3. 1次出力（本文生成・現在ロード中のモデル）</button>{badge_gen}</form>"
@@ -1084,8 +1093,8 @@ def work_detail(work_id: int):
     <div class='card'><h2>工程の実行</h2>
     <p>モード：<b>{'単章モード（1章完結・対話的に詰める）' if (w.get('mode') or 'switch') == 'single' else ('スレッドモード（モデル切替なし・章ごとスレッド）' if (w.get('mode') or 'switch') == 'thread' else '切替モード（1次出力→モデル切替→2次修正）')}</b>（作品情報で変更できます）</p>
     {ws_html}
-    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='outline'><button>2. 次章の内容（各章概要）を生成</button>{badge_outline}</form>
-    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='expand_plans'><button>2.5 各章を展開（詳細概要・開始/終了状態・内容詳細を章ごとに連鎖生成）</button>{badge_expand}</form>
+    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='outline'><button>2. 次章の内容①：各章概要を生成</button>{badge_outline}</form>
+    <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='expand_plans'><button>2. 次章の内容②：各章を展開（展開計画：詳細概要・開始/終了状態・内容詳細を章ごとに連鎖生成）</button>{badge_expand}</form>
     {thread_buttons if (w.get('mode') or 'switch') in ('thread', 'single') else switch_buttons}
     {single_html}
     <p><a href='/works/{w['id']}/download'>5. まとめテキストをダウンロード（TXT化・final）</a></p>

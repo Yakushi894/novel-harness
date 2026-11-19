@@ -693,6 +693,7 @@ def do_outline(job, work):
     if not by_num:
         save_artifact(work, None, "log", "outline_failed.txt", text)
         raise RuntimeError("概要のパースに失敗しました（第1章以降の章が読み取れず。モデルの生出力を成果物のログに保存しました）")
+    _write_phase(work["id"], "章概要を保存中", "")
     try:
         db.run("DELETE FROM chapters WHERE work_id=? AND number>=1", (work["id"],))
         for n in sorted(by_num):
@@ -1840,8 +1841,13 @@ def worker_loop():
                     add_notice(work, "工程が停止ボタンで中断されました。途中まで生成された章は再実行できます。")
             except Exception as e:
                 traceback.print_exc()
+                err = str(e)
+                if work:
+                    ph = db.get_setting(f"live:phase:{work['id']}", "")
+                    if ph:
+                        err = f"{err}【発生箇所：{ph}】"
                 db.run("UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
-                       (str(e)[:500], db.now(), job["id"]))
+                       (err[:500], db.now(), job["id"]))
                 if work:
                     if isinstance(e, llm.LoopDetectedError) and not e.saved_log:
                         # 章に紐づかない工程（概要・解析・状態・要約など）でループした場合は
