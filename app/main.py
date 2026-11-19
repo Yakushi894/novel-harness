@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.58"
+APP_VERSION = "1.59"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -968,7 +968,7 @@ def work_detail(work_id: int):
         if design_art:
             design_block = (f"<details><summary>生成指示書</summary>"
                             f"<pre>{esc(pipeline.read_text(design_art['path']))}</pre></details>")
-        ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3>第{ch['number']}章 {esc(ch['title'])}（<span id='ch-status-{ch['number']}'>{esc(ch['status'])}</span>）</h3>
+        ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3 title='{esc(ch['title'])}'>第{ch['number']}章 {esc(_short_title(ch['title']))}（<span id='ch-status-{ch['number']}'>{esc(ch['status'])}</span>）</h3>
         {chars_note}
         <form method='post' action='/chapters/{ch['id']}'>
         <div class='row'>タイトル<input type='text' name='title' value="{esc(ch['title'])}"></div>
