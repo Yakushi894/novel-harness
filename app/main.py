@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.60"
+APP_VERSION = "1.61"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -239,7 +239,7 @@ _PLAN_STATE_STYLE = {
     "生成中": "#b97d1a",
     "生成済み": "#1a7f37",
     "再生成中": "#2471a3",
-    "再生成済み": "#7d3c98",
+    "再生成済み": "#1a7f37",
 }
 
 
