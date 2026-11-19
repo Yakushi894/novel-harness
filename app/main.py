@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.53"
+APP_VERSION = "1.54"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -200,11 +200,24 @@ def _sidebar_status() -> str:
                     pass
         age = max(0, int(_time.time() - last)) if last else None
         stale = run is None and (age is None or age >= 1800)
-        if not stale:
+        slots = llm.slots_status()
+        if slots is not None and slots.get("n_ctx"):
+            used = int(slots.get("n_prompt_tokens") or 0)
+            total = int(slots["n_ctx"])
+            live_fill = min(100, round(used / total * 100)) if total else 0
+            html += (
+                f"<div>コンテキスト Fill：{live_fill}%（{used:,} / {total:,} tok）</div>"
+                f"<div style='background:#333;height:6px;border-radius:3px;margin:.2em 0'>"
+                f"<div style='background:#e8862e;height:6px;border-radius:3px;width:{live_fill}%'></div></div>")
+        elif slots is not None:
+            html += "<div>コンテキスト Fill：―（モデル未ロード）</div>"
+        elif not stale:
             html += (
                 f"<div>コンテキスト Fill：{fill}%（{(pt + ct):,} / {ctx:,} tok）</div>"
                 f"<div style='background:#333;height:6px;border-radius:3px;margin:.2em 0'>"
-                f"<div style='background:#e8862e;height:6px;border-radius:3px;width:{fill}%'></div></div>"
+                f"<div style='background:#e8862e;height:6px;border-radius:3px;width:{fill}%'></div></div>")
+        if not stale:
+            html += (
                 f"<div>GPU プリフィル：{_fmt_tps(pre)} tok/s</div>"
                 f"<div>GPU デコード：{_fmt_tps(dec)} tok/s</div>")
         at = db.get_setting("live:at", "")

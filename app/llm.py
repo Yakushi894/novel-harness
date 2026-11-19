@@ -307,6 +307,48 @@ def current_model():
     return m if m else "strata"
 
 
+_SLOTS_CACHE = {"at": 0.0, "value": None}
+
+
+def slots_status():
+    """GET /slots の実測：推論サーバーが今保持しているコンテキスト量。
+    {"n_prompt_tokens": 使用量, "n_ctx": 窓, "is_processing": 処理中か} を返す。
+    モデル未ロード（空リスト）の場合は n_ctx=0 で返す。サーバーに届かない、
+    または /slots が無い・形式が違う場合は None（表示側は前回値にフォールバック）。
+    結果は5秒キャッシュし、タイムアウトは2秒（表示を待たせないため）。"""
+    if MOCK:
+        try:
+            return {"n_prompt_tokens": int(os.environ.get("MOCK_SLOTS_PROMPT", "0") or 0),
+                    "n_ctx": int(os.environ.get("MOCK_SLOTS_CTX", "262144") or 0),
+                    "is_processing": os.environ.get("MOCK_SLOTS_BUSY", "") == "1"}
+        except ValueError:
+            return None
+    if not base_url():
+        return None
+    now = time.time()
+    if now - _SLOTS_CACHE["at"] < 5:
+        return _SLOTS_CACHE["value"]
+    value = None
+    try:
+        r = httpx.get(f"{base_url()}/slots", headers=_headers(), timeout=2)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            if not data:
+                value = {"n_prompt_tokens": 0, "n_ctx": 0, "is_processing": False}
+            else:
+                s = data[0]
+                n_ctx = int(s.get("n_ctx") or 0)
+                if n_ctx:
+                    value = {"n_prompt_tokens": int(s.get("n_prompt_tokens") or 0),
+                             "n_ctx": n_ctx,
+                             "is_processing": bool(s.get("is_processing"))}
+    except Exception:
+        value = None
+    _SLOTS_CACHE.update(at=now, value=value)
+    return value
+
+
 # chat(body=True) で呼ばれた本文系呼び出しの間だけ True（呼び出しは直列前提）。
 _BODY_CALL = False
 
