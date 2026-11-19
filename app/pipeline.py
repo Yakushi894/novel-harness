@@ -320,7 +320,11 @@ def settings_text(work, ctx=None):
     for a in db.q("SELECT * FROM artifacts WHERE work_id=? AND kind='character' ORDER BY id", (work["id"],)):
         parts.append("【キャラクター資料】\n" + read_text(a["path"]))
     for a in db.q("SELECT * FROM artifacts WHERE work_id=? AND kind='source' ORDER BY id", (work["id"],)):
-        parts.append(read_text(a["path"]))
+        parts.append("【既存文書（第0章）】\n"
+                     "以下は、ユーザーがアップロードした既に書かれた前文です。文体と設定の参照用であり、"
+                     "生成する章はこの続きとして新しい内容にしてください。この文書の内容を、そのまま、"
+                     "あるいは要約・再構成して新しい章として繰り返してはいけません。\n"
+                     + read_text(a["path"]))
     return "\n\n".join(p for p in parts if p)[:ctx_budget_chars(ctx)]
 
 
@@ -650,6 +654,10 @@ def do_outline(job, work):
     user = prompts.OUTLINE_USER.format(
         request=work["request"], settings=settings_text(work),
         source="", num_chapters=work["num_chapters"])
+    if is_continuation(work):
+        user += ("\n\n【重要】設定資料に含まれる既存文書は「第0章」として既に書かれた前文です。"
+                 "第1章以降の概要は、その続きとして新しい出来事を進める内容にしてください。"
+                 "既存文書の内容を第1章として要約・再構成しないでください。")
     text = llm.chat(
         "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
@@ -1115,6 +1123,10 @@ def _range_one_outline(work, ch):
         request=work["request"], settings=settings_text(work),
         state=current_state(work, ch["number"]),
         outlines=outlines_text(work), number=ch["number"])
+    if is_continuation(work):
+        user += ("\n\n【重要】設定資料に含まれる既存文書は「第0章」として既に書かれた前文です。"
+                 "この章の概要は、その続きとして新しい出来事を進める内容にしてください。"
+                 "既存文書の内容を要約・再構成しないでください。")
     text = llm.chat(
         "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
@@ -1694,6 +1706,10 @@ def do_outline_chapter(job, work):
     user = prompts.OUTLINE_ONE_USER.format(
         request=work["request"], settings=settings_text(work),
         outlines=outlines_text(work), number=ch["number"])
+    if is_continuation(work):
+        user += ("\n\n【重要】設定資料に含まれる既存文書は「第0章」として既に書かれた前文です。"
+                 "この章の概要は、その続きとして新しい出来事を進める内容にしてください。"
+                 "既存文書の内容を要約・再構成しないでください。")
     text = llm.chat(
         "auto", prompts.OUTLINE_SYSTEM + sys_note(work), user,
         max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
