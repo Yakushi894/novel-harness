@@ -406,15 +406,19 @@ def _sync_plan_from_body(work, ch, actual_state):
     """
     sections = get_plan(work, ch)
     if sections:
+        prev = dict(sections)
         sections["章終了時の状態"] = actual_state
         sections["次章開始状態"] = actual_state
+        _record_plan_sections(work, ch, prev, sections)
         save_artifact(work, ch, "plan", f"ch{ch['number']:03d}_plan.txt", plan_to_text(sections))
     nxt = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?",
                  (work["id"], ch["number"] + 1))
     if nxt:
         nsec = get_plan(work, nxt)
         if nsec:
+            nprev = dict(nsec)
             nsec["章開始時の状態"] = actual_state
+            _record_plan_sections(work, nxt, nprev, nsec)
             save_artifact(work, nxt, "plan", f"ch{nxt['number']:03d}_plan.txt", plan_to_text(nsec))
 
 
@@ -710,6 +714,8 @@ def do_outline(job, work):
 
 # ---------- 章の展開計画（全体章概要の後に章ごとに展開する） ----------
 PLAN_SECTIONS = ["詳細概要", "章開始時の状態", "章終了時の目標状態", "章内容詳細", "章終了時の状態", "次章開始状態", "終了状態"]
+# 追加指定つき再生成（do_regen_plan）が作り直す節（他は既存を保持する）
+PLAN_REGEN_SECTIONS = ("章内容詳細", "章終了時の状態", "次章開始状態", "終了状態")
 
 
 def parse_plan(text):
@@ -745,6 +751,64 @@ def get_plan(work, ch):
     return parse_plan(read_text(a["path"])) if a else None
 
 
+def _record_plan_sections(work, ch, prev_sections, new_sections):
+    """計画の保存前に呼び、本文が変わった節だけ版数を数える（plan_sec_ver:<章ID>）。
+
+    計画の再生成は節の一部だけを作り直す場合がある（追加指定つき再生成や
+    本文からの実績同期）ため、計画全体の保存回数ではなく「その節の本文が
+    変わった回数」を節ごとに記録し、画面の状態チップを節単位で出す材料にする。
+    """
+    try:
+        vers = json.loads(db.get_setting(f"plan_sec_ver:{ch['id']}", "") or "{}")
+    except ValueError:
+        vers = {}
+    changed = False
+    for name in PLAN_SECTIONS:
+        new = (new_sections.get(name) or "").strip()
+        old = ((prev_sections or {}).get(name) or "").strip()
+        if new and new != old:
+            vers[name] = int(vers.get(name) or 0) + 1
+            changed = True
+    if changed:
+        db.set_setting(f"plan_sec_ver:{ch['id']}", json.dumps(vers, ensure_ascii=False))
+
+
+def plan_section_versions(chapter_id):
+    """節ごとの版数（{節名: 版数}）。まだ記録が無ければ None（表示側で保存回数に代用）。"""
+    raw = db.get_setting(f"plan_sec_ver:{chapter_id}", "")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def bump_body_version(chapter_id, kind):
+    """本文の完成保存のたびに版数を数える（body_ver:<章ID> = {"draft": n, "final": n}）。
+
+    書き足し（ensure_min_chars）の途中保存では数えず、完成として保存した
+    回数だけを数える。画面の 生成済み／再生成済み／再々生成済み の材料。
+    """
+    try:
+        vers = json.loads(db.get_setting(f"body_ver:{chapter_id}", "") or "{}")
+    except ValueError:
+        vers = {}
+    vers[kind] = int(vers.get(kind) or 0) + 1
+    db.set_setting(f"body_ver:{chapter_id}", json.dumps(vers))
+
+
+def body_version(chapter_id, kind):
+    """本文の版数（未記録なら 0。表示側では成果物があれば最低1として扱う）。"""
+    raw = db.get_setting(f"body_ver:{chapter_id}", "")
+    if raw:
+        try:
+            return int(json.loads(raw).get(kind) or 0)
+        except ValueError:
+            pass
+    return 0
+
+
 def plan_start_state(work, ch, chapters):
     """展開時の章開始状態：前章の計画の「次章開始状態」を最優先で引き継ぐ。"""
     if ch["number"] > 1:
@@ -757,6 +821,7 @@ def plan_start_state(work, ch, chapters):
 
 
 def _save_plan(work, ch, sections):
+    _record_plan_sections(work, ch, get_plan(work, ch), sections)
     save_artifact(work, ch, "plan", f"ch{ch['number']:03d}_plan.txt", plan_to_text(sections))
     if sections.get("章終了時の状態"):
         # 状態チェーンにも流し、本文生成の開始状態として使えるようにする
@@ -969,7 +1034,7 @@ def do_regen_plan(job, work):
     if not new.get("章内容詳細") or not new.get("章終了時の状態"):
         save_artifact(work, ch, "log", f"ch{ch['number']:03d}_plan_failed.txt", text)
         raise RuntimeError("再生成した計画のパースに失敗しました（モデルの生出力を成果物のログに保存しました）")
-    for k in ("章内容詳細", "章終了時の状態", "次章開始状態", "終了状態"):
+    for k in PLAN_REGEN_SECTIONS:
         if new.get(k):
             sections[k] = new[k]
     _save_plan(work, ch, sections)
@@ -1057,6 +1122,7 @@ def _body_pass(job, work, chapters, thread=False):
             save_think(work, ch)
             body = ensure_min_chars(job, work, ch, body, progress=pw)
             save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+            bump_body_version(ch["id"], "draft")
             clear_partial(work, ch)
             db.set_setting(f"work:{work['id']}:draft_model", used_model)
             update_state(work, ch, body, prev_state)
@@ -1114,8 +1180,8 @@ def _missing_state_message(work, number):
                     or latest_artifact(work["id"], prev["id"], "draft"))
         if has_body:
             return (f"第{number}章の終了状態（キャラ表含む）がありません。"
-                    f"第{number}章の本文はあるので、章ページで「終了状態のみ（再）生成」を押して"
-                    f"終了状態を作ってください（本文から作り直す場合は「本文＋状態（再）生成」でも構いません）。")
+                    f"第{number}章の本文はあるので、章ページで「本文＋状態（再）生成」を押して"
+                    f"終了状態を作り直してください（展開計画から作り直す場合は「展開計画～終了状態まで自動再生成」でも構いません）。")
         return (f"第{number}章の終了状態（キャラ表含む）がありません。"
                 f"第{number}章の章ページで「本文＋状態（再）生成」を押して、"
                 f"第{number}章の本文と終了状態を作ってください。")
@@ -1271,6 +1337,7 @@ def revise_chapters(job, work, chapters, model_changed=False):
             notify(f"【小説ハーネス】「{work['title']}」{msg}")
         save_artifact(work, ch, "revised", f"ch{ch['number']:03d}.txt", revised)
         save_artifact(work, ch, "final", f"ch{ch['number']:03d}.txt", revised)
+        bump_body_version(ch["id"], "final")
         set_chapter_status(ch["id"], "final")
     return True
 
@@ -1320,6 +1387,7 @@ def do_generate_thread(job, work):
                 save_think(work, ch)
                 body = ensure_min_chars(job, work, ch, body, progress=pw)
                 save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+                bump_body_version(ch["id"], "draft")
                 clear_partial(work, ch)
                 db.set_setting(f"work:{work['id']}:draft_model", used_model)
                 update_state(work, ch, body, prev_state)
@@ -1594,6 +1662,7 @@ def do_regen_chapter(job, work):
         save_think(work, ch)
         body = ensure_min_chars(job, work, ch, body, progress=pw)
         save_artifact(work, ch, "draft", f"ch{ch['number']:03d}.txt", body)
+        bump_body_version(ch["id"], "draft")
         clear_partial(work, ch)
         for kind in ("revised", "final"):
             for a in db.q("SELECT * FROM artifacts WHERE work_id=? AND chapter_id=? AND kind=?",
@@ -1675,37 +1744,25 @@ def do_revise_outline(job, work):
            "章ページで確認し、よければ本文を再生成してください。")
 
 
-def do_regen_state(job, work):
-    """終了状態のみ再生成：既存の本文（final優先、なければdraft）はそのままに、
-    その章の終了状態（状態チェーン）と要約だけを作り直す。
+def do_regen_full(job, work):
+    """「展開計画～終了状態まで自動再生成」：この章の展開計画を作り直し、
+    続けて本文＋終了状態・要約を再生成する（本文側は do_regen_chapter 本体を共用）。
 
-    状態の生成で変なところで止まって本文だけ残った場合の復旧用。
-    本文は書き直さないので、本文＋状態（再）生成より短時間で済む。
+    v1.62 で「終了状態のみ（再）生成」を廃止し（ユーザー指示）、計画から
+    やり直す一括導線として追加した。計画は前章までの状態から作り直されるため、
+    本文も新しい計画に沿って生成される。
     """
-    payload = json.loads(job["payload"] or "{}")
-    ch = db.one("SELECT * FROM chapters WHERE id=?", (payload.get("chapter_id"),))
-    if not ch:
-        raise RuntimeError("対象の章が見つかりません")
-    art = (latest_artifact(work["id"], ch["id"], "final")
-           or latest_artifact(work["id"], ch["id"], "draft"))
-    if not art:
-        raise RuntimeError("本文がまだ生成されていません。先に本文を生成してください")
-    body = read_text(art["path"])
-    prev_state = current_state(work, ch["number"])
     try:
-        update_state(work, ch, body, prev_state)
-        summary = llm.chat(
-            "auto", prompts.SUMMARY_SYSTEM,
-            prompts.SUMMARY_USER.format(number=ch["number"], title=ch["title"], text=body),
-            max_tokens=max_tokens("max_tokens_summary", "MAX_TOKENS_SUMMARY", 4096),
-            temperature=temperature(), phase=f"第{ch['number']}章 要約を作成中")
-        save_artifact(work, ch, "summary", f"ch{ch['number']:03d}.txt", summary)
-    except llm.LoopDetectedError as e:
-        save_loop_log(work, ch, "終了状態の再生成", e)
-        raise
-    if ch["status"] == "outlined":
-        set_chapter_status(ch["id"], "generated")
-    return f"第{ch['number']}章の終了状態を再生成しました"
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    ch = db.one("SELECT * FROM chapters WHERE id=? AND work_id=?",
+                (payload.get("chapter_id"), work["id"]))
+    if not ch:
+        raise RuntimeError("再生成する章が見つかりません。")
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work["id"],))
+    _expand_one_plan(work, ch, chapters)
+    do_regen_chapter(job, work)
 
 
 def do_outline_chapter(job, work):
@@ -1754,7 +1811,7 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "generate_chapters": do_generate_chapters, "revise_all": do_revise_all,
             "search_term": do_search_term, "term_check": do_term_check,
             "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
-            "regen_state": do_regen_state,
+            "regen_full": do_regen_full,
             "expand_plans": do_expand_plans, "regen_plan": do_regen_plan,
             "expand_plan_one": do_expand_plan_one, "final_check": do_final_check,
             "range_generate": do_range_generate,

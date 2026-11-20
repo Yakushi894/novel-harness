@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.61"
+APP_VERSION = "1.62"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -240,30 +240,54 @@ _PLAN_STATE_STYLE = {
     "生成済み": "#1a7f37",
     "再生成中": "#2471a3",
     "再生成済み": "#1a7f37",
+    "再々生成済み": "#1a7f37",
 }
 
 
-def _plan_sections_html(sections, active, plan_count):
+def _plan_sections_html(sections, active_sections, vers, plan_count):
     """展開計画の節一覧を、節ごとの状態チップ付きで描く。
 
-    状態は 未生成（内容なし）⇒ 生成中（実行中・内容なし）⇒ 生成済み
-    （内容あり・初版）⇒ 再生成中（実行中・内容あり）⇒ 再生成済み
-    （内容あり・2版目以降）の順に遷移する。計画は1回の生成で全節が
-    まとめて作られるため、状態は節ではなく計画単位で決まる。
+    状態は節ごとに判定する：実行中ジョブの対象節（active_sections）に
+    入っていれば 生成中／再生成中、その節の版数（vers＝本文が変わった
+    回数）が2以上で 再生成済み、1で 生成済み、内容が無ければ 未生成。
+    vers が未記録（旧データ）の章は計画全体の保存回数 plan_count で代用する。
+    実行したところだけ状態が変わるよう、計画単位ではなく節単位で見る。
     """
     out = ""
     for name in pipeline.PLAN_SECTIONS:
         body = (sections or {}).get(name) or ""
-        if body:
-            state = "再生成中" if active else ("再生成済み" if plan_count >= 2 else "生成済み")
+        if name in (active_sections or set()):
+            state = "再生成中" if body else "生成中"
+        elif not body:
+            state = "未生成"
         else:
-            state = "生成中" if active else "未生成"
+            ver = (vers or {}).get(name)
+            if ver is None:
+                ver = plan_count
+            state = "再生成済み" if int(ver or 0) >= 2 else "生成済み"
         chip = (f" <span style='color:{_PLAN_STATE_STYLE[state]};font-weight:700'>"
                 f"（{state}）</span>")
         inner = (f"<pre>{esc(body)}</pre>" if body
                  else "<p class='muted'>まだ生成されていません。</p>")
         out += f"<details><summary>{esc(name)}{chip}</summary>{inner}</details>"
     return out
+
+
+def _plan_active_sections(jobs, ch):
+    """実行中ジョブが対象にする展開計画の節の集合（チップの 生成中／再生成中 用）。
+
+    追加指定つき再生成（regen_plan）は作り直す節が決まっているのでその節だけ、
+    展開計画の全体生成と「展開計画～終了状態まで自動再生成」は全節を対象にする。
+    """
+    secs = set()
+    for j in jobs:
+        if not _job_targets_chapter(j, ch):
+            continue
+        if j["kind"] == "regen_plan":
+            secs |= set(pipeline.PLAN_REGEN_SECTIONS)
+        elif j["kind"] in ("expand_plan_one", "expand_plans", "regen_full"):
+            secs |= set(pipeline.PLAN_SECTIONS)
+    return secs
 
 
 def _short_title(t, n=10):
@@ -724,6 +748,7 @@ JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成
               "regen_plan": "展開計画の再生成", "generate_chapters": "本文生成（1次出力）",
               "generate_thread": "章ごとスレッド生成", "revise_all": "2次修正",
               "regen_chapter": "本文の再生成", "regen_state": "終了状態の再生成",
+              "regen_full": "展開計画～終了状態まで自動再生成",
               "revise_outline": "修正概要の作成",
               "outline_chapter": "概要の再生成", "search_term": "キャラクター検索",
               "term_check": "用語チェック", "final_check": "最終チェック",
@@ -870,6 +895,7 @@ def _chapter_live_html(w, ch) -> str:
 
 
 CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "regen_state": "終了状態の再生成",
+                      "regen_full": "展開計画～終了状態まで自動再生成",
                       "revise_outline": "修正概要の作成",
                       "expand_plan_one": "展開計画の生成（この章のみ）",
                       "outline_chapter": "概要の再生成"}
@@ -974,12 +1000,10 @@ def work_detail(work_id: int):
         chars_note = (f"<div class='row'>本文：{chars}文字"
                       + (f"（最低{min_chars}文字）" if min_chars > 0 else "") + "</div>") if chars else ""
         plan_secs = pipeline.get_plan(w, ch)
-        p_active = any(
-            j["kind"] in ("regen_plan", "expand_plan_one", "expand_plans")
-            and _job_targets_chapter(j, ch) for j in active_jobs_w)
         p_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
                          "AND kind='plan'", (w["id"], ch["id"]))["c"]
-        sec_html = _plan_sections_html(plan_secs, p_active, p_count)
+        sec_html = _plan_sections_html(plan_secs, _plan_active_sections(active_jobs_w, ch),
+                                       pipeline.plan_section_versions(ch["id"]), p_count)
         plan_block = (f"<details><summary>展開計画（詳細概要・開始/終了状態・内容詳細）</summary>"
                       f"{sec_html}</details>")
         if plan_secs:
@@ -1442,17 +1466,10 @@ def chapter_page(chapter_id: int):
     active = any(j["status"] in ("queued", "running") for j in jobs)
     job_html = _chapter_jobs_html(jobs, {c["id"]: c for c in chapters})
 
-    # 再生成の表記：既存の本文・計画があり、対象ジョブが動いている間は「再生成中」。
-    # 計画の節ごとの状態チップは _plan_sections_html が付ける。
+    # 状態チップ：本文は版数（完成保存の回数）で 生成済み／再生成済み／再々生成済み、
+    # 計画は節ごとに _plan_sections_html が付ける。実行中は対象に応じて 生成中／再生成中。
     active_jobs = db.q("SELECT * FROM jobs WHERE work_id=? AND status IN ('queued','running')",
                        (w["id"],))
-    body_regen = bool(draft or final) and any(
-        j["kind"] in ("regen_chapter", "range_generate", "generate_chapters",
-                      "generate_thread", "revise_all") and _job_targets_chapter(j, ch)
-        for j in active_jobs)
-    plan_regen_active = any(
-        j["kind"] in ("regen_plan", "expand_plan_one", "expand_plans")
-        and _job_targets_chapter(j, ch) for j in active_jobs)
     plan_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
                         "AND kind='plan'", (w["id"], ch["id"]))["c"]
 
@@ -1464,9 +1481,22 @@ def chapter_page(chapter_id: int):
                 f"<summary>{label}（{len(text)}文字）</summary>"
                 f"<pre>{esc(text)}</pre></details>")
 
-    regen_suffix = "※再生成" if body_regen else ""
-    draft_html = _body_card(draft, f"本文（1次出力）{regen_suffix}", opened=not final)
-    final_html = _body_card(final, f"本文（2次修正）{regen_suffix}", opened=True)
+    def _body_chip(kind, art):
+        kinds = (("regen_chapter", "regen_full", "range_generate", "generate_chapters",
+                  "generate_thread") if kind == "draft" else ("revise_all",))
+        act = any(j["kind"] in kinds and _job_targets_chapter(j, ch) for j in active_jobs)
+        if act:
+            state = "再生成中" if art else "生成中"
+        elif art:
+            ver = pipeline.body_version(ch["id"], kind) or 1
+            state = "生成済み" if ver <= 1 else ("再生成済み" if ver == 2 else "再々生成済み")
+        else:
+            return ""
+        return (f" <span style='color:{_PLAN_STATE_STYLE[state]};font-weight:700'>"
+                f"（{state}）</span>")
+
+    draft_html = _body_card(draft, f"本文（1次出力）{_body_chip('draft', draft)}", opened=not final)
+    final_html = _body_card(final, f"本文（2次修正）{_body_chip('final', final)}", opened=True)
     if not draft and not final:
         draft_html = "<div class='card'><h2>本文</h2><p>まだ生成されていません。</p></div>"
     status_line = (f"<div class='card'><p>状態：<span id='ch-status-self'>{esc(ch['status'])}</span>"
@@ -1480,7 +1510,8 @@ def chapter_page(chapter_id: int):
                    f"<pre>{esc(pipeline.read_text(design['path']))}</pre></details>") if design else ""
     plan_secs_ch = pipeline.get_plan(w, ch)
     plan_html = ("<div class='card'><h2>展開計画</h2>"
-                 + _plan_sections_html(plan_secs_ch, plan_regen_active, plan_count))
+                 + _plan_sections_html(plan_secs_ch, _plan_active_sections(active_jobs, ch),
+                                       pipeline.plan_section_versions(ch["id"]), plan_count))
     if plan_secs_ch:
         pending_ch = db.get_setting(f"plan_pending:{w['id']}", "")
         max_num_ch = db.one("SELECT MAX(number) AS m FROM chapters WHERE work_id=?", (w["id"],))["m"] or 0
@@ -1548,9 +1579,9 @@ def chapter_page(chapter_id: int):
     <form method='post' action='/chapters/{ch['id']}/regen' class='act'>
     <button>本文＋状態（再）生成</button>
     <span>本文に合わせて終了状態（状態チェーン）と要約も作り直します（従来の再生成）。</span></form>
-    <form method='post' action='/chapters/{ch['id']}/regen_state' class='act'>
-    <button>終了状態のみ（再）生成</button>
-    <span>今ある本文はそのままに、終了状態（状態チェーン）と要約だけを作り直します。状態の生成で止まってしまった場合の復旧用です（本文は書き直さないので短時間で済みます）。</span></form></div>
+    <form method='post' action='/chapters/{ch['id']}/regen_full' class='act'>
+    <button>展開計画～終了状態まで自動再生成</button>
+    <span>この章の展開計画を作り直し、その計画で本文・終了状態（状態チェーン）・要約までを自動で一括再生成します。</span></form></div>
     {prev_state_html}
     {status_line}
     {draft_html}
@@ -1684,13 +1715,13 @@ def chapter_regen(chapter_id: int, notes: str = Form(""), with_state: str = Form
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 
-@app.post("/chapters/{chapter_id}/regen_state")
-def chapter_regen_state(chapter_id: int):
-    """終了状態のみ再生成（本文はそのまま、状態と要約だけ作り直す復旧用）。"""
+@app.post("/chapters/{chapter_id}/regen_full")
+def chapter_regen_full(chapter_id: int):
+    """展開計画～終了状態まで自動再生成（計画→本文→状態・要約を一括で作り直す）。"""
     ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
     if not ch:
         return RedirectResponse("/", status_code=303)
-    enqueue(ch["work_id"], "regen_state", {"chapter_id": chapter_id})
+    enqueue(ch["work_id"], "regen_full", {"chapter_id": chapter_id})
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 
