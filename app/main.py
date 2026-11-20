@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.62"
+APP_VERSION = "1.63"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -285,7 +285,7 @@ def _plan_active_sections(jobs, ch):
             continue
         if j["kind"] == "regen_plan":
             secs |= set(pipeline.PLAN_REGEN_SECTIONS)
-        elif j["kind"] in ("expand_plan_one", "expand_plans", "regen_full"):
+        elif j["kind"] in ("expand_plan_one", "expand_plans", "regen_full", "plan_design"):
             secs |= set(pipeline.PLAN_SECTIONS)
     return secs
 
@@ -745,6 +745,7 @@ def _jobs_html(w, jobs) -> str:
 
 JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成",
               "expand_plans": "各章を展開", "expand_plan_one": "展開計画の生成（この章のみ）",
+              "plan_design": "展開計画・生成指示書の再生成（この章のみ）",
               "regen_plan": "展開計画の再生成", "generate_chapters": "本文生成（1次出力）",
               "generate_thread": "章ごとスレッド生成", "revise_all": "2次修正",
               "regen_chapter": "本文の再生成", "regen_state": "終了状態の再生成",
@@ -898,6 +899,7 @@ CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "regen_state": "終
                       "regen_full": "展開計画～終了状態まで自動再生成",
                       "revise_outline": "修正概要の作成",
                       "expand_plan_one": "展開計画の生成（この章のみ）",
+                      "plan_design": "展開計画・生成指示書の再生成（この章のみ）",
                       "outline_chapter": "概要の再生成"}
 CHAPTER_JOB_KINDS = tuple(CHAPTER_JOB_LABELS)
 
@@ -1031,7 +1033,9 @@ def work_detail(work_id: int):
         <form method='post' action='/chapters/{ch['id']}/outline_regen' style='margin-top:.5em'>
         <button>この章の概要だけ再生成</button></form>
         <form method='post' action='/chapters/{ch['id']}/expand_plan' style='margin-top:.5em'>
-        <button>この章の展開計画のみ生成</button></form>{plan_block}{design_block}
+        <button>この章の展開計画のみ生成</button></form>
+        <form method='post' action='/chapters/{ch['id']}/expand_plan_design' style='margin-top:.5em'>
+        <button>この章の展開計画・生成指示書再生成</button></form>{plan_block}{design_block}
         <div class='row'><a href='/chapters/{ch['id']}'>章ページを開く（本文・Think・状態・修正要綱で再生成）</a></div>
         <form method='post' action='/chapters/{ch['id']}/delete' onsubmit="return confirm('この章を削除しますか？（本文・概要も消えます）')" style='margin-top:.5em'>
         <button style='background:#b03a3a;border-color:#b03a3a'>この章を削除</button></form></div>"""
@@ -1572,6 +1576,9 @@ def chapter_page(chapter_id: int):
     <form method='post' action='/chapters/{ch['id']}/expand_plan' class='act'>
     <button>この章の展開計画のみ生成</button>
     <span>この章のみ、細概要・開始/終了状態・内容詳細（展開計画）を作ります（全章一括の「2.5 各章を展開」と同じ内容を1章だけ）。</span></form>
+    <form method='post' action='/chapters/{ch['id']}/expand_plan_design' class='act'>
+    <button>この章の展開計画・生成指示書再生成</button>
+    <span>この章の展開計画と生成指示書の両方を作り直します（本文は変わりません）。章概要を反映し直した後に、計画と指示書を新しい概要でそろえる用途です。</span></form>
     <form method='post' action='/chapters/{ch['id']}/regen' class='act'>
     <input type='hidden' name='with_state' value='0'>
     <button>本文のみ（再）生成</button>
@@ -1732,6 +1739,16 @@ def chapter_expand_plan(chapter_id: int):
     if not ch:
         return RedirectResponse("/", status_code=303)
     enqueue(ch["work_id"], "expand_plan_one", {"chapter_id": chapter_id})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/expand_plan_design")
+def chapter_expand_plan_design(chapter_id: int):
+    """この章の展開計画と生成指示書を両方作り直す（本文は変えない）。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    enqueue(ch["work_id"], "plan_design", {"chapter_id": chapter_id})
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 

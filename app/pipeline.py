@@ -1003,6 +1003,26 @@ def do_expand_plan_one(job, work):
     _expand_one_plan(work, ch, chapters)
 
 
+def do_plan_design(job, work):
+    """この章の展開計画と生成指示書を両方作り直す（本文は変えない）。
+
+    章ページの「この章の展開計画・生成指示書再生成」用。計画は現在の章概要から、
+    指示書は通常の本文生成と同じ材料（設定・開始状態・要約・前章末尾＋欲しい内容）
+    で作り直す。新しい章概要を反映した後に、計画と指示書をそろえるための導線。
+    """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    ch = db.one("SELECT * FROM chapters WHERE id=? AND work_id=?",
+                (payload.get("chapter_id"), work["id"]))
+    if not ch:
+        raise RuntimeError("対象の章が見つかりません。")
+    chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work["id"],))
+    _expand_one_plan(work, ch, chapters)
+    design_prompt(work, ch, work["request"] or "")
+
+
 def do_regen_plan(job, work):
     """追加指定による当該章の計画再生成：詳細概要と開始状態は固定し、内容詳細以降を作り直す。
 
@@ -1813,7 +1833,8 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "generate_thread": do_generate_thread, "regen_chapter": do_regen_chapter,
             "regen_full": do_regen_full,
             "expand_plans": do_expand_plans, "regen_plan": do_regen_plan,
-            "expand_plan_one": do_expand_plan_one, "final_check": do_final_check,
+            "expand_plan_one": do_expand_plan_one, "plan_design": do_plan_design,
+            "final_check": do_final_check,
             "range_generate": do_range_generate,
             "revise_outline": do_revise_outline, "outline_chapter": do_outline_chapter}
 
