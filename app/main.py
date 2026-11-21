@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.63"
+APP_VERSION = "1.64"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -776,6 +776,40 @@ def _peek_text(work, ch):
     return "", "", None
 
 
+def _work_progress_text(w, chapters) -> str:
+    """現在の進み具合を1行で表す（概要・本文・2次修正がどこまで作成済みか）。
+
+    章番号が1から連続していれば「第X章まで」、欠けがあれば「Y章分」と
+    数え方を変え、実態と違う「まで」表記にならないようにする。第0章
+    （読み込んだ文書）は生成対象ではないので数に入れない。
+    """
+    gen = [c for c in chapters if c["number"] >= 1]
+    if not gen:
+        return "現在：章がまだありません。"
+
+    def upto(nums):
+        s = set(nums)
+        if not s:
+            return "未作成"
+        m = 0
+        while m + 1 in s:
+            m += 1
+        if s == set(range(1, m + 1)):
+            return f"第{m}章まで作成済み"
+        return f"{len(s)}章分作成済み"
+
+    outlines = [c["number"] for c in gen if (c["outline"] or "").strip()]
+    drafts, finals = [], []
+    for c in gen:
+        if pipeline.latest_artifact(w["id"], c["id"], "final"):
+            finals.append(c["number"])
+            drafts.append(c["number"])
+        elif pipeline.latest_artifact(w["id"], c["id"], "draft"):
+            drafts.append(c["number"])
+    return (f"現在：概要 {upto(outlines)}・本文 {upto(drafts)}・"
+            f"2次修正 {upto(finals)}（全{len(gen)}章）")
+
+
 def _current_work_html(w) -> str:
     """「現在の作業」パネル：実行中／停止した工程と、本文の途中経過をちら見せする。"""
     jobs = db.q("SELECT * FROM jobs WHERE work_id=? ORDER BY id DESC LIMIT 5", (w["id"],))
@@ -832,16 +866,26 @@ def _current_work_html(w) -> str:
             if ph:
                 head += f"<p style='color:#2e7d32'><b>いま：{esc(ph)}</b></p>"
         return head + peek_html(j, ch)
+    # 実行中でないときは、直近ジョブの成否を作品の状態として出し続けず、
+    # 「現在の進み具合」＋「最後に実行した結果」を出す（1回のエラーで
+    # 作品がエラーのままに見える、というユーザー指摘への対応）。
+    prog = _work_progress_text(w, chapters)
+    when = _fmt_ts(j["updated_at"])
     if j["status"] == "done":
-        return f"<p>待機中です。直近の工程「{esc(label)}」は完了しています。</p>"
+        return (f"<p>{prog}</p>"
+                f"<p class='muted'>最後に実行した結果：「{esc(label)}」は完了しています"
+                f"{('（' + when + '）') if when else ''}。</p>")
     if j["status"] == "cancelled":
-        head = (f"<p><b style='color:#b03a3a'>■ 停止中</b>：{esc(label)}"
-                f"{('（' + ch_note + '）') if ch_note else ''} は停止ボタンで中断されました。"
-                "止まった場所は下の本文で確認できます。</p>")
+        head = (f"<p>{prog}</p>"
+                f"<p class='muted'>最後に実行した結果：「{esc(label)}」"
+                f"{('（' + ch_note + '）') if ch_note else ''}は停止ボタンで中断されました"
+                f"{('（' + when + '）') if when else ''}。止まった場所は下の本文で確認できます。</p>")
         return head + peek_html(j, ch)
-    head = (f"<p><b style='color:#b03a3a'>■ 停止中</b>：{esc(label)}"
-            f"{('（' + ch_note + '）') if ch_note else ''} でエラーが発生しました。"
-            f"<br><span class='muted'>{esc((j['error'] or '')[:200])}</span></p>")
+    head = (f"<p>{prog}</p>"
+            f"<p class='muted'>最後に実行した結果：「{esc(label)}」"
+            f"{('（' + ch_note + '）') if ch_note else ''}はエラー終了しました"
+            f"{('（' + when + '）') if when else ''}。"
+            f"<br>{esc((j['error'] or '')[:200])}</p>")
     return head + peek_html(j, ch)
 
 
@@ -1044,15 +1088,22 @@ def work_detail(work_id: int):
     # 直近ジョブが失敗した工程は、成果物が揃っていても「✖ エラー終了」を優先表示する
     _seen_kind = set()
     _job_done = set()
-    _job_failed = set()
-    for j in db.q("SELECT kind, status FROM jobs WHERE work_id=? ORDER BY id DESC", (work_id,)):
+    _failed_ids = {}
+    _latest_done_id = 0
+    for j in db.q("SELECT id, kind, status FROM jobs WHERE work_id=? ORDER BY id DESC", (work_id,)):
+        if j["status"] == "done" and not _latest_done_id:
+            _latest_done_id = j["id"]
         if j["kind"] in _seen_kind:
             continue
         _seen_kind.add(j["kind"])
         if j["status"] == "done":
             _job_done.add(j["kind"])
         elif j["status"] == "failed":
-            _job_failed.add(j["kind"])
+            _failed_ids[j["kind"]] = j["id"]
+    # エラー終了バッジは「その失敗より後に成功したジョブが1つも無い」場合だけ。
+    # 別の工程でも成功があれば復旧済みとみなし、バッジは成果物の状態に戻す
+    # （1回のエラーで工程がエラーのままに見える、というユーザー指摘への対応）。
+    _job_failed = {k for k, fid in _failed_ids.items() if fid > _latest_done_id}
     _all_ch = {c["id"] for c in chapters}
     _plan_ch = {a["chapter_id"] for a in arts if a["kind"] == "plan"}
     _body_ch = {a["chapter_id"] for a in arts if a["kind"] in ("draft", "final")}
