@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.64"
+APP_VERSION = "1.65"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -296,6 +296,33 @@ def _short_title(t, n=10):
     return t[:n] + "・・・・" if len(t) > n else t
 
 
+# 章ステータスの日本語ラベルと色。サイドバー（暗い背景）と本文エリア
+# （明るい背景）のどちらでも読める中間色に寄せている。
+CH_STATUS_JA = {
+    "outlined": ("概要のみ", "#9099a3"),
+    "generating": ("生成中", "#e09a26"),
+    "generated": ("本文生成済み", "#35a45b"),
+    "revising": ("修正中", "#3b8bd4"),
+    "final": ("修正済み", "#35a45b"),
+}
+
+
+def _ch_status_label(status) -> str:
+    return CH_STATUS_JA.get(status, (status, "#9099a3"))[0]
+
+
+def _ch_status_style(status) -> str:
+    color = CH_STATUS_JA.get(status, (status, "#9099a3"))[1]
+    bold = "font-weight:700;" if status == "final" else ""
+    return f"color:{color};{bold}"
+
+
+def _ch_status_html(status) -> str:
+    """章ステータスを「（日本語ラベル）」の色付き表示で返す。"""
+    return (f"<span style='{_ch_status_style(status)}'>"
+            f"（{esc(_ch_status_label(status))}）</span>")
+
+
 def sidebar(current_id=None, chapters=None) -> str:
     try:
         works = db.q("SELECT * FROM works ORDER BY id DESC")
@@ -318,7 +345,7 @@ def sidebar(current_id=None, chapters=None) -> str:
             for c in chs:
                 items += (
                     f"<div class='ch-item'><a href='/chapters/{c['id']}' title='{esc(c['title'])}'>第{c['number']}章 {esc(_short_title(c['title']))}"
-                    f"（{esc(c['status'])}）</a>"
+                    f"{_ch_status_html(c['status'])}</a>"
                     f"<form method='post' action='/chapters/{c['id']}/delete' "
                     "onsubmit=\"return confirm('この章を削除しますか？（本文・概要も消えます）')\" style='margin:0'>"
                     "<button class='ch-del' title='この章を削除'>✕</button></form></div>")
@@ -360,6 +387,11 @@ POLL_SCRIPT = """
       for(var tid in texts){
         var e = document.getElementById(tid);
         if(e && e.textContent !== texts[tid]) e.textContent = texts[tid];
+      }
+      var styles = j.styles || {};
+      for(var sid in styles){
+        var se = document.getElementById(sid);
+        if(se && se.style.cssText !== styles[sid]) se.style.cssText = styles[sid];
       }
       if(nearBottom) window.scrollTo(0, document.documentElement.scrollHeight);
       setTimeout(tick, 4000);
@@ -1068,7 +1100,7 @@ def work_detail(work_id: int):
         if design_art:
             design_block = (f"<details><summary>生成指示書</summary>"
                             f"<pre>{esc(pipeline.read_text(design_art['path']))}</pre></details>")
-        ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3 title='{esc(ch['title'])}'>第{ch['number']}章 {esc(_short_title(ch['title']))}（<span id='ch-status-{ch['number']}'>{esc(ch['status'])}</span>）</h3>
+        ch_html += f"""<div class='card' id='ch-{ch['number']}'><h3 title='{esc(ch['title'])}'>第{ch['number']}章 {esc(_short_title(ch['title']))}（<span id='ch-status-{ch['number']}' style='{_ch_status_style(ch['status'])}'>{esc(_ch_status_label(ch['status']))}</span>）</h3>
         {chars_note}
         <form method='post' action='/chapters/{ch['id']}'>
         <div class='row'>タイトル<input type='text' name='title' value="{esc(ch['title'])}"></div>
@@ -1554,7 +1586,7 @@ def chapter_page(chapter_id: int):
     final_html = _body_card(final, f"本文（2次修正）{_body_chip('final', final)}", opened=True)
     if not draft and not final:
         draft_html = "<div class='card'><h2>本文</h2><p>まだ生成されていません。</p></div>"
-    status_line = (f"<div class='card'><p>状態：<span id='ch-status-self'>{esc(ch['status'])}</span>"
+    status_line = (f"<div class='card'><p>状態：<span id='ch-status-self' style='{_ch_status_style(ch['status'])}'>{esc(_ch_status_label(ch['status']))}</span>"
                    + (f" ／ 最低{min_chars}文字" if min_chars > 0 else "") + "</p></div>")
     think_html = (f"<details class='card'><summary>Think（思考過程）</summary>"
                   f"<pre>{esc(pipeline.read_text(think['path']))}</pre></details>") if think else ""
@@ -1687,8 +1719,9 @@ def work_live(work_id: int):
     }
     if (w.get("mode") or "switch") == "single":
         regions["dyn-single"] = _single_gen_html(w, chapters[0] if chapters else None)
-    texts = {f"ch-status-{c['number']}": c["status"] for c in chapters}
-    return JSONResponse({"reload": not active, "regions": regions, "texts": texts})
+    texts = {f"ch-status-{c['number']}": _ch_status_label(c["status"]) for c in chapters}
+    styles = {f"ch-status-{c['number']}": _ch_status_style(c["status"]) for c in chapters}
+    return JSONResponse({"reload": not active, "regions": regions, "texts": texts, "styles": styles})
 
 
 @app.get("/chapters/{chapter_id}/live.json")
@@ -1711,7 +1744,8 @@ def chapter_live(chapter_id: int):
         "dyn-side": _sidebar_status(),
     }
     return JSONResponse({"reload": not active, "regions": regions,
-                         "texts": {"ch-status-self": ch["status"]}})
+                         "texts": {"ch-status-self": _ch_status_label(ch["status"])},
+                         "styles": {"ch-status-self": _ch_status_style(ch["status"])}})
 
 
 @app.post("/chapters/{chapter_id}/plan_regen")
