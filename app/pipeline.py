@@ -1258,6 +1258,8 @@ def do_range_generate(job, work):
     一括概要生成と違い1章ずつ刻むので、10章を超える長編でも一発生成の
     失敗（出力切れ・形式崩れ）が起きにくい。本文は1次出力までで止め、
     推敲（2次修正・仕上げ）は従来のボタンを別に押す前提。
+    作り直し（redo）は章概要をそのまま（編集・反映済みの概要）使い、
+    展開計画と本文を作り直す。概要が無い章は先に概要を作成する。
     payload: {from, to, redo, analyze_first}
     """
     try:
@@ -1280,7 +1282,7 @@ def do_range_generate(job, work):
         raise RuntimeError("第0章（読み込んだ文書）は作り直しの対象にできません")
     if lo >= 1 and not _prev_end_state_exists(work, lo):
         raise RuntimeError(_missing_state_message(work, lo - 1))
-    # --- 概要を1章ずつ ---
+    # --- 概要を1章ずつ（無い章だけ。作り直しでも章概要はそのまま使う） ---
     for n in range(lo, hi + 1):
         if _cancelled(job):
             return
@@ -1289,8 +1291,18 @@ def do_range_generate(job, work):
             cid = db.run("INSERT INTO chapters(work_id, number, title, outline, status) "
                          "VALUES(?,?,'','','outlined')", (work["id"], n))
             ch = db.one("SELECT * FROM chapters WHERE id=?", (cid,))
-        if redo or not (ch["outline"] or "").strip():
+        if not (ch["outline"] or "").strip():
             _range_one_outline(work, ch)
+    # --- 作り直しでは展開計画も作り直す（今の章概要から、章の並び順に連鎖） ---
+    if redo:
+        all_chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number",
+                            (work["id"],))
+        for n in range(lo, hi + 1):
+            if _cancelled(job):
+                return
+            ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?", (work["id"], n))
+            if ch and ch["status"] in ("outlined", "generated"):
+                _expand_one_plan(work, ch, all_chapters)
     # --- 本文（推敲なし） ---
     if redo:
         db.run("UPDATE chapters SET status='outlined' WHERE work_id=? AND number BETWEEN ? AND ? AND status='generated'",
