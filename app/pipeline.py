@@ -1740,6 +1740,20 @@ def do_revise_outline(job, work):
     notes = (payload.get("notes") or "").strip()
     if not notes:
         raise RuntimeError("修正要綱が空です。直したい点を入力してください。")
+    text = _make_rev_outline(work, ch, ch["outline"], notes,
+                             f"第{ch['number']}章 修正概要を作成中")
+    save_artifact(work, ch, "rev_outline", f"ch{ch['number']:03d}_rev_outline.txt", text)
+    db.set_setting(f"rev_outline_notes:{ch['id']}", notes)
+    notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章の修正概要ができました。"
+           "章ページで確認し、よければ本文を再生成してください。")
+
+
+def _make_rev_outline(work, ch, base_outline, notes, phase):
+    """修正概要の本文を生成して返す（保存は呼び出し側）。
+
+    base_outline は作り直しの土台：通常は正規の章概要、追記ラウンドでは
+    前回の修正概要を渡す。
+    """
     plan_secs = get_plan(work, ch)
     plan_text = plan_to_text(plan_secs) if plan_secs else "（なし）"
     try:
@@ -1749,19 +1763,52 @@ def do_revise_outline(job, work):
                 request=work["request"], settings=settings_text(work),
                 outlines=outlines_text(work),
                 state=current_state(work, ch["number"]),
-                number=ch["number"], title=ch["title"], outline=ch["outline"],
+                number=ch["number"], title=ch["title"], outline=base_outline,
                 plan=plan_text, notes=notes),
             max_tokens=max_tokens("max_tokens_outline", "MAX_TOKENS_OUTLINE", 16384),
-            temperature=temperature(), phase=f"第{ch['number']}章 修正概要を作成中")
+            temperature=temperature(), phase=phase)
     except llm.LoopDetectedError as e:
         save_loop_log(work, ch, "修正概要の作成", e)
         raise
     if not text.strip():
         raise RuntimeError("修正概要の生成結果が空でした。もう一度お試しください。")
+    return text
+
+
+def do_revise_more(job, work):
+    """修正概要への追記＋本文の再生成（2回目以降の修正ラウンド）。
+
+    今の修正概要を土台に、追記の修正指示を反映した新しい修正概要を作り、
+    続けてその修正概要で本文を再生成する（do_regen_chapter の修正概要
+    経路を共用）。使った要綱は rev_outline_notes に【追記】として累積し、
+    正規の章概要は変えない。
+    """
+    try:
+        payload = json.loads(job.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    ch = db.one("SELECT * FROM chapters WHERE id=? AND work_id=?",
+                (payload.get("chapter_id"), work["id"]))
+    if not ch:
+        raise RuntimeError("修正概要へ追記する章が見つかりません。")
+    notes = (payload.get("notes") or "").strip()
+    if not notes:
+        raise RuntimeError("追記の修正指示が空です。追加で直したい点を入力してください。")
+    prev_art = latest_artifact(work["id"], ch["id"], "rev_outline")
+    prev_text = read_text(prev_art["path"]).strip() if prev_art else ""
+    if not prev_text:
+        raise RuntimeError("追記する修正概要がまだありません。"
+                           "先にステップ1で修正概要を作成してください。")
+    text = _make_rev_outline(work, ch, prev_text, notes,
+                             f"第{ch['number']}章 修正概要へ追記中")
     save_artifact(work, ch, "rev_outline", f"ch{ch['number']:03d}_rev_outline.txt", text)
-    db.set_setting(f"rev_outline_notes:{ch['id']}", notes)
-    notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章の修正概要ができました。"
-           "章ページで確認し、よければ本文を再生成してください。")
+    old_notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
+    cumulative = (old_notes + f"\n【追記】\n{notes}").strip() if old_notes else notes
+    db.set_setting(f"rev_outline_notes:{ch['id']}", cumulative)
+    sub_job = dict(job)
+    sub_job["payload"] = json.dumps(
+        {"chapter_id": ch["id"], "notes": cumulative, "use_rev_outline": True})
+    do_regen_chapter(sub_job, work)
 
 
 def do_regen_full(job, work):
@@ -1836,7 +1883,8 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "expand_plan_one": do_expand_plan_one, "plan_design": do_plan_design,
             "final_check": do_final_check,
             "range_generate": do_range_generate,
-            "revise_outline": do_revise_outline, "outline_chapter": do_outline_chapter}
+            "revise_outline": do_revise_outline, "revise_more": do_revise_more,
+            "outline_chapter": do_outline_chapter}
 
 
 def _cancelled(job):
