@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.66"
+APP_VERSION = "1.67"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -784,6 +784,7 @@ JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成
               "regen_full": "展開計画～終了状態まで自動再生成",
               "revise_outline": "修正概要の作成",
               "revise_more": "修正概要への追記＋本文の再生成",
+              "revise_append": "修正概要への追記（概要のみ）",
               "outline_chapter": "概要の再生成", "search_term": "キャラクター検索",
               "term_check": "用語チェック", "final_check": "最終チェック",
               "range_generate": "範囲指定の生成（概要＋本文）"}
@@ -976,6 +977,7 @@ CHAPTER_JOB_LABELS = {"regen_chapter": "本文の再生成", "regen_state": "終
                       "regen_full": "展開計画～終了状態まで自動再生成",
                       "revise_outline": "修正概要の作成",
                       "revise_more": "修正概要への追記＋本文の再生成",
+                      "revise_append": "修正概要への追記（概要のみ）",
                       "expand_plan_one": "展開計画の生成（この章のみ）",
                       "plan_design": "展開計画・生成指示書の再生成（この章のみ）",
                       "outline_chapter": "概要の再生成"}
@@ -1647,9 +1649,10 @@ def chapter_page(chapter_id: int):
     <button>章概要（1回目）で本文を再生成</button></form>
     <form method='post' action='/chapters/{ch['id']}/revise_more'>
     <div class='row'>追加の修正指示（追記）<textarea name='notes' rows='3' placeholder='例：やっぱり手紙の伏線は削る。冒頭の天気描写をもう少し長く。'></textarea></div>
-    <button>追記して修正概要を作り直し、本文を再生成</button></form>
+    <button>追記して修正概要を作り直し、本文を再生成</button>
+    <button formaction='/chapters/{ch['id']}/revise_append'>追記して修正概要のみ作り直す（本文はまだ）</button></form>
     <p>「ステップ2」は修正概要のまま本文を再生成します（生成指示書も作り直し、別スレッド実行・Context Window の80%まで使用。正規の章概要は変わりません）。<br>
-    「追記して…」は、今の修正概要を土台に追加の修正指示を反映した新しい修正概要を作り、そのまま本文の再生成まで一括で進めます（2回目以降の修正ラウンド用）。<br>
+    「追記して…」は、今の修正概要を土台に追加の修正指示を反映した新しい修正概要を作ります。「…本文を再生成」はそのまま本文の再生成まで一括、「…概要のみ作り直す」は新しい修正概要を確認してからステップ2へ進む使い方です（2回目以降の修正ラウンド用）。追記した内容は上の「使った修正要綱」に【追記1】【追記2】…として残ります。<br>
     「章概要（1回目）へ反映」は修正概要を正規の章概要に昇格させます（本文は変わりません）。反映後に「章概要（1回目）で本文を再生成」を押すと、正規の章概要をもとに生成指示書を作り直して本文を再生成します。</p></div>"""
 
     body = f"""
@@ -1876,6 +1879,16 @@ def chapter_revise_more(chapter_id: int, notes: str = Form("")):
     if not ch:
         return RedirectResponse("/", status_code=303)
     enqueue(ch["work_id"], "revise_more", {"chapter_id": chapter_id, "notes": notes})
+    return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
+
+
+@app.post("/chapters/{chapter_id}/revise_append")
+def chapter_revise_append(chapter_id: int, notes: str = Form("")):
+    """修正概要への追記のみ（本文は再生成しない）ジョブを積む。"""
+    ch = db.one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+    if not ch:
+        return RedirectResponse("/", status_code=303)
+    enqueue(ch["work_id"], "revise_append", {"chapter_id": chapter_id, "notes": notes})
     return RedirectResponse(f"/chapters/{chapter_id}", status_code=303)
 
 

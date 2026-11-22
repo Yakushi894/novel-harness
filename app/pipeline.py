@@ -1775,14 +1775,8 @@ def _make_rev_outline(work, ch, base_outline, notes, phase):
     return text
 
 
-def do_revise_more(job, work):
-    """修正概要への追記＋本文の再生成（2回目以降の修正ラウンド）。
-
-    今の修正概要を土台に、追記の修正指示を反映した新しい修正概要を作り、
-    続けてその修正概要で本文を再生成する（do_regen_chapter の修正概要
-    経路を共用）。使った要綱は rev_outline_notes に【追記】として累積し、
-    正規の章概要は変えない。
-    """
+def _revise_target(job, work):
+    """追記系ジョブの対象章と追記文を取り出す（検証込み）。"""
     try:
         payload = json.loads(job.get("payload") or "{}")
     except ValueError:
@@ -1794,6 +1788,15 @@ def do_revise_more(job, work):
     notes = (payload.get("notes") or "").strip()
     if not notes:
         raise RuntimeError("追記の修正指示が空です。追加で直したい点を入力してください。")
+    return ch, notes
+
+
+def _append_rev_outline(work, ch, notes):
+    """今の修正概要へ追記を反映した新しい修正概要を保存し、累積要綱を返す。
+
+    使った要綱は rev_outline_notes に「【追記1】【追記2】…」と回数付きで
+    累積し、章ページの「使った修正要綱」に各回の追記内容が残る。
+    """
     prev_art = latest_artifact(work["id"], ch["id"], "rev_outline")
     prev_text = read_text(prev_art["path"]).strip() if prev_art else ""
     if not prev_text:
@@ -1803,8 +1806,35 @@ def do_revise_more(job, work):
                              f"第{ch['number']}章 修正概要へ追記中")
     save_artifact(work, ch, "rev_outline", f"ch{ch['number']:03d}_rev_outline.txt", text)
     old_notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
-    cumulative = (old_notes + f"\n【追記】\n{notes}").strip() if old_notes else notes
+    if old_notes:
+        n = old_notes.count("【追記") + 1
+        cumulative = (old_notes + f"\n【追記{n}】\n{notes}").strip()
+    else:
+        cumulative = notes
     db.set_setting(f"rev_outline_notes:{ch['id']}", cumulative)
+    return cumulative
+
+
+def do_revise_append(job, work):
+    """修正概要への追記のみ（本文は再生成しない）。
+
+    新しい修正概要を確認してから、ステップ2で本文を再生成する使い方。
+    """
+    ch, notes = _revise_target(job, work)
+    _append_rev_outline(work, ch, notes)
+    notify(f"【小説ハーネス】「{work['title']}」第{ch['number']}章の修正概要へ追記しました。"
+           "章ページで確認し、よければ本文を再生成してください。")
+
+
+def do_revise_more(job, work):
+    """修正概要への追記＋本文の再生成（2回目以降の修正ラウンド）。
+
+    今の修正概要を土台に、追記の修正指示を反映した新しい修正概要を作り、
+    続けてその修正概要で本文を再生成する（do_regen_chapter の修正概要
+    経路を共用）。正規の章概要は変えない。
+    """
+    ch, notes = _revise_target(job, work)
+    cumulative = _append_rev_outline(work, ch, notes)
     sub_job = dict(job)
     sub_job["payload"] = json.dumps(
         {"chapter_id": ch["id"], "notes": cumulative, "use_rev_outline": True})
@@ -1884,6 +1914,7 @@ HANDLERS = {"analyze": do_analyze, "outline": do_outline,
             "final_check": do_final_check,
             "range_generate": do_range_generate,
             "revise_outline": do_revise_outline, "revise_more": do_revise_more,
+            "revise_append": do_revise_append,
             "outline_chapter": do_outline_chapter}
 
 
