@@ -1794,23 +1794,26 @@ def _revise_target(job, work):
 def _append_rev_outline(work, ch, notes):
     """今の修正概要へ追記を反映した新しい修正概要を保存し、累積要綱を返す。
 
-    使った要綱は rev_outline_notes に「【追記1】【追記2】…」と回数付きで
-    累積し、章ページの「使った修正要綱」に各回の追記内容が残る。
+    追記は単発で渡さず、前回までの修正指示へ「【1回目】【2回目】…」と
+    回数マーカー付きで積み増した累積要綱をまとめ、修正概要の作り直しには
+    その累積要綱ごと入れ込む（過去の回の指示が作り直しで薄れないように）。
+    累積要綱は rev_outline_notes に保存され、章ページの「使った修正要綱」
+    に各回の追記内容が残る。旧形式の【追記N】マーカーも回数に数える。
     """
     prev_art = latest_artifact(work["id"], ch["id"], "rev_outline")
     prev_text = read_text(prev_art["path"]).strip() if prev_art else ""
     if not prev_text:
         raise RuntimeError("追記する修正概要がまだありません。"
                            "先にステップ1で修正概要を作成してください。")
-    text = _make_rev_outline(work, ch, prev_text, notes,
+    old_notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
+    n = len(re.findall(r"【追記\d+】|【\d+回目】", old_notes)) + 1
+    if old_notes:
+        cumulative = (old_notes + f"\n【{n}回目】\n{notes}").strip()
+    else:
+        cumulative = f"【{n}回目】\n{notes}"
+    text = _make_rev_outline(work, ch, prev_text, cumulative,
                              f"第{ch['number']}章 修正概要へ追記中")
     save_artifact(work, ch, "rev_outline", f"ch{ch['number']:03d}_rev_outline.txt", text)
-    old_notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "")
-    if old_notes:
-        n = old_notes.count("【追記") + 1
-        cumulative = (old_notes + f"\n【追記{n}】\n{notes}").strip()
-    else:
-        cumulative = notes
     db.set_setting(f"rev_outline_notes:{ch['id']}", cumulative)
     return cumulative
 
