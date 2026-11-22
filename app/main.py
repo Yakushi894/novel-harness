@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.67"
+APP_VERSION = "1.68"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -398,6 +398,27 @@ POLL_SCRIPT = """
     }).catch(function(){ setTimeout(tick, 8000); });
   }
   setTimeout(tick, 4000);
+})();
+</script>
+"""
+
+
+FOLD_SCRIPT = """
+<script>
+// 本文（1次出力）の折りたたみ状態を WEB セッション内で覚える：
+// 一度折りたたんだら、ほかの章でも折りたたんだ状態で始まる（開き直したらそちらを覚える）。
+(function(){
+  var KEY = 'nh:fold:draft';
+  var d = document.querySelector("details[data-fold='draft']");
+  if(!d) return;
+  try{
+    var v = sessionStorage.getItem(KEY);
+    if(v === 'closed') d.removeAttribute('open');
+    else if(v === 'open') d.setAttribute('open', '');
+  }catch(e){}
+  d.addEventListener('toggle', function(){
+    try{ sessionStorage.setItem(KEY, d.open ? 'open' : 'closed'); }catch(e){}
+  });
 })();
 </script>
 """
@@ -1564,11 +1585,12 @@ def chapter_page(chapter_id: int):
     plan_count = db.one("SELECT COUNT(*) AS c FROM artifacts WHERE work_id=? AND chapter_id=? "
                         "AND kind='plan'", (w["id"], ch["id"]))["c"]
 
-    def _body_card(art, label, opened):
+    def _body_card(art, label, opened, fold_key=None):
         if not art:
             return ""
         text = pipeline.read_text(art["path"])
-        return (f"<details class='card'{' open' if opened else ''}>"
+        fold = f" data-fold='{fold_key}'" if fold_key else ""
+        return (f"<details class='card'{fold}{' open' if opened else ''}>"
                 f"<summary>{label}（{len(text)}文字）</summary>"
                 f"<pre>{esc(text)}</pre></details>")
 
@@ -1586,7 +1608,8 @@ def chapter_page(chapter_id: int):
         return (f" <span style='color:{_PLAN_STATE_STYLE[state]};font-weight:700'>"
                 f"（{state}）</span>")
 
-    draft_html = _body_card(draft, f"本文（1次出力）{_body_chip('draft', draft)}", opened=not final)
+    draft_html = _body_card(draft, f"本文（1次出力）{_body_chip('draft', draft)}", opened=not final,
+                            fold_key="draft")
     final_html = _body_card(final, f"本文（2次修正）{_body_chip('final', final)}", opened=True)
     if not draft and not final:
         draft_html = "<div class='card'><h2>本文</h2><p>まだ生成されていません。</p></div>"
@@ -1697,7 +1720,8 @@ def chapter_page(chapter_id: int):
     <button>ステップ1：修正要綱から修正概要を作成</button></form>
     <p>まず修正要綱に沿って章概要を作り直した「修正概要」を作成します。内容を確認・編集してよければ、ステップ2で本文を再生成してください。本文の再生成で本文・Think・終了状態・要約が作り直されます。2次修正済みの章では修正済み本文（final）が消え、1次出力の状態に戻ります。入力状態（前章までの状態）は変わりません。</p>
     <div id='dyn-jobs'>{job_html}</div></div>
-    {rev_html}"""
+    {rev_html}
+    {FOLD_SCRIPT}"""
     live_on = active or bool(live_html) or ch["status"] in ("generating", "revising")
     return page(f"第{ch['number']}章 {ch['title']}", body,
                 current_id=w["id"], chapters=chapters,
