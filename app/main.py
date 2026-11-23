@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.73"
+APP_VERSION = "1.74"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -1282,6 +1282,7 @@ def work_detail(work_id: int):
     {thread_buttons if (w.get('mode') or 'switch') in ('thread', 'single') else switch_buttons}
     {single_html}
     <form method='get' action='/works/{w['id']}/download'><button>5. まとめテキストをダウンロード（TXT化・final）</button></form>
+    <form method='post' action='/works/{w['id']}/export_combined'><button>5. まとめテキストを作品フォルダに書き出す（一覧PHPで開く用）</button></form>
     {php_html}
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='final_check'><button>6. 最終チェック（全章横断：文字数・繰り返し・登場・矛盾）</button>{badge_check}</form></div>
     {range_html}
@@ -1998,6 +1999,42 @@ def artifact_view(artifact_id: int):
         f"onsubmit=\"return confirm('この成果物を削除しますか？')\">"
         f"<button>この成果物を削除</button></form></div>")
     return page(f"{a['kind']} #{a['id']}", head + f"<pre>{esc(pipeline.read_text(a['path']))}</pre>")
+
+
+@app.post("/works/{work_id}/export_combined")
+def work_export_combined(work_id: int):
+    """まとめテキストを作品フォルダ直下の「まとめ.txt」に書き出す。
+
+    フォルダ内ファイルの一覧を表示する PHP（ユーザーの既存環境）から
+    そのまま開けるようにするための書き出し。final を優先し、無い章は
+    下書き（draft）を「（下書き）」付きで含める。
+    """
+    w = db.one("SELECT * FROM works WHERE id=?", (work_id,))
+    if not w:
+        return PlainTextResponse("not found", status_code=404)
+    parts = [w["title"], ""]
+    used = 0
+    for ch in db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number", (work_id,)):
+        a = pipeline.latest_artifact(work_id, ch["id"], "final")
+        draft = False
+        if not a:
+            a = pipeline.latest_artifact(work_id, ch["id"], "draft")
+            draft = bool(a)
+        if a:
+            parts.append(f"第{ch['number']}章　{ch['title']}" + ("（下書き）" if draft else ""))
+            parts.append("")
+            parts.append(pipeline.read_text(a["path"]))
+            parts.append("")
+            used += 1
+    if not used:
+        pipeline.add_notice(w, "書き出せる本文（final／下書き）がまだありません。")
+        return RedirectResponse(f"/works/{work_id}", status_code=303)
+    path = os.path.join(pipeline.work_dir(w["slug"]), "まとめ.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+    pipeline.add_notice(w, f"まとめテキストを作品フォルダに書き出しました：{w['slug']}/まとめ.txt（全{used}章）。"
+                           "フォルダ一覧の PHP から開けます。")
+    return RedirectResponse(f"/works/{work_id}", status_code=303)
 
 
 @app.get("/works/{work_id}/download")
