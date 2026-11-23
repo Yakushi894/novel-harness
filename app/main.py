@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.74"
+APP_VERSION = "1.75"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -1182,17 +1182,6 @@ def work_detail(work_id: int):
     badge_rev_thread = _badge_f("revise_all" in _job_done, "revise_all")
     badge_check = _badge_f("final_check" in _job_done or any(a["kind"] == "check" for a in arts), "final_check")
 
-    # 工程5の書き出し：PHPビューア（全章結合）へのボタン。飛び先は設定で登録する。
-    php_base = db.get_setting("php_viewer_url", "").strip()
-    if php_base:
-        sep = "&" if "?" in php_base else "?"
-        php_html = (f"<p><a href='{esc(php_base)}{sep}work={esc(w['slug'])}' target='_blank' rel='noopener'>"
-                    "<button type='button'>5. 全章をPHPで結合して書き出す（PHPビューアで開く）</button></a></p>")
-    else:
-        php_html = ("<p class='muted'>PHPビューアのURLが未設定のため、「全章をPHPで結合して書き出す」ボタンは"
-                    "まだ使えません。設定画面の「PHPビューアのURL」に Web Station の index.php の"
-                    "アドレスを登録してください。</p>")
-
     switch_buttons = (
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='generate_chapters'><button>3. 1次出力（本文生成・現在ロード中のモデル）</button>{badge_gen}</form>"
         f"<form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='revise_all'><button>4. 2次修正（モデル切替を検知して自動実行）</button>{badge_rev}</form>")
@@ -1283,7 +1272,6 @@ def work_detail(work_id: int):
     {single_html}
     <form method='get' action='/works/{w['id']}/download'><button>5. まとめテキストをダウンロード（TXT化・final）</button></form>
     <form method='post' action='/works/{w['id']}/export_combined'><button>5. まとめテキストを作品フォルダに書き出す（一覧PHPで開く用）</button></form>
-    {php_html}
     <form method='post' action='/works/{w['id']}/jobs'><input type='hidden' name='kind' value='final_check'><button>6. 最終チェック（全章横断：文字数・繰り返し・登場・矛盾）</button>{badge_check}</form></div>
     {range_html}
     <h2>章と概要</h2>
@@ -2092,7 +2080,6 @@ def settings_form():
     <div class='row'>APIキー（{'設定済み' if has_key else '未設定'}／空欄なら変更しません。LAN 内でキー不要な場合は空のままでOK）<input type='password' name='strata_api_key' value=''></div>
     <div class='row'>2次修正モデルの目印（ロード中モデルIDに含まれる文字列。空欄なら「1次出力と違うモデルへの変更」で判定）<input type='text' name='revise_model_hint' value="{esc(db.get_setting('revise_model_hint', ''))}" placeholder='例：q4'></div>
     <div class='row'>Synology Chat Webhook URL（空欄なら通知はコンテナのログのみ）<input type='text' name='chat_webhook_url' value="{esc(db.get_setting('chat_webhook_url', ''))}"></div>
-    <div class='row'>PHPビューアのURL（Web Station に置いた index.php のアドレス。作品ページの「全章をPHPで結合して書き出す」ボタンの飛び先になります）<input type='text' name='php_viewer_url' value="{esc(db.get_setting('php_viewer_url', ''))}" placeholder='例：http://192.168.1.10/novel/index.php'></div>
     </div>
     <div class='card'><h2>モデル / 生成パラメータ</h2>
     <p style='color:#e5484d;font-weight:bold;margin:.3em 0'>※ 値を変更しても、保存を押すまで変更されません（画面の数値はプレビューです）。</p>
@@ -2212,7 +2199,6 @@ def settings_form():
 @app.post("/settings")
 def settings_save(strata_base_url: str = Form(""), strata_api_key: str = Form(""),
                   revise_model_hint: str = Form(""), chat_webhook_url: str = Form(""),
-                  php_viewer_url: str = Form(""),
                   ctx_window: str = Form(""), ctx_window_revise: str = Form(""),
                   max_tokens_outline: str = Form(""),
                   max_tokens_design: str = Form(""), max_tokens_chapter: str = Form(""),
@@ -2227,7 +2213,6 @@ def settings_save(strata_base_url: str = Form(""), strata_api_key: str = Form(""
         db.set_setting("strata_api_key", strata_api_key.strip())
     db.set_setting("revise_model_hint", revise_model_hint.strip())
     db.set_setting("chat_webhook_url", chat_webhook_url.strip())
-    db.set_setting("php_viewer_url", php_viewer_url.strip())
     db.set_setting("web_search_enabled", "1" if web_search_enabled == "1" else "0")
     db.set_setting("show_fanfic_button", "1" if show_fanfic_button == "1" else "0")
     db.set_setting("design_no_truncate", "1" if design_no_truncate == "1" else "0")
