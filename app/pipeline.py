@@ -1252,6 +1252,53 @@ def _range_one_outline(work, ch):
            (picked[0].strip(), picked[1].strip(), ch["id"]))
 
 
+def _do_range_regen(job, work, lo, hi):
+    """範囲指定「指定章再生成」：範囲内の章を1章ずつ作り直す。
+
+    章概要はそのまま使う。修正概要がある章はそれを参考にし（展開計画は
+    修正概要を実効概要として作り直し、本文は章ページのステップ2と同じ
+    修正概要フローで再生成）、無い章は詳細概要～終了状態まで展開計画を
+    作り直してから本文を再生成する（生成指示書も作り直す）。
+    2次修正済み（final）の章も対象で、final は前版に残して1次出力に戻る。
+    """
+    all_chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number",
+                        (work["id"],))
+    for n in range(lo, hi + 1):
+        if _cancelled(job):
+            return
+        ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?", (work["id"], n))
+        if not ch:
+            continue
+        rev_art = latest_artifact(work["id"], ch["id"], "rev_outline")
+        rev_text = read_text(rev_art["path"]).strip() if rev_art else ""
+        if not rev_text and not (ch["outline"] or "").strip():
+            _range_one_outline(work, ch)
+            ch = db.one("SELECT * FROM chapters WHERE id=?", (ch["id"],)) or ch
+        # 展開計画（詳細概要～終了状態）を今の実効概要から作り直す
+        ch_eff = {k: ch[k] for k in ch.keys()}
+        if rev_text:
+            ch_eff["outline"] = rev_text
+        _expand_one_plan(work, ch_eff, all_chapters)
+        # 本文の再生成（修正概要がある章はステップ2フロー、無い章は指示書も作り直す）
+        if not rev_text:
+            design_prompt(work, ch, work["request"] or "")
+        notes = db.get_setting(f"rev_outline_notes:{ch['id']}", "") if rev_text else ""
+        sub = dict(job)
+        sub["payload"] = json.dumps(
+            {"chapter_id": ch["id"], "use_rev_outline": bool(rev_text),
+             "notes": notes, "with_state": True}, ensure_ascii=False)
+        do_regen_chapter(sub, work)
+    thread = (work.get("mode") or "switch") == "thread"
+    if thread:
+        set_stage(work["id"], "body_ready")
+        notify(f"【小説ハーネス】「{work['title']}」の指定章再生成（第{lo}章〜第{hi}章）が終わりました（推敲なし）。"
+               "仕上げは「4. 仕上げ修正のみ」ボタンで実行してください。")
+    else:
+        set_stage(work["id"], "wait_model")
+        notify(f"【小説ハーネス】「{work['title']}」の指定章再生成（第{lo}章〜第{hi}章）の1次出力が終わりました。"
+               "2次修正に使うモデルへ切り替えて下さい。")
+
+
 def do_range_generate(job, work):
     """長編向け範囲生成：指定範囲の概要を1章ずつ作り、続けて本文（推敲なし）を作る。
 
@@ -1282,6 +1329,9 @@ def do_range_generate(job, work):
         raise RuntimeError("第0章（読み込んだ文書）は作り直しの対象にできません")
     if lo >= 1 and not _prev_end_state_exists(work, lo):
         raise RuntimeError(_missing_state_message(work, lo - 1))
+    if payload.get("regen"):
+        _do_range_regen(job, work, lo, hi)
+        return
     # --- 概要を1章ずつ（無い章だけ。作り直しでも章概要はそのまま使う） ---
     for n in range(lo, hi + 1):
         if _cancelled(job):
@@ -1293,16 +1343,20 @@ def do_range_generate(job, work):
             ch = db.one("SELECT * FROM chapters WHERE id=?", (cid,))
         if not (ch["outline"] or "").strip():
             _range_one_outline(work, ch)
-    # --- 作り直しでは展開計画も作り直す（今の章概要から、章の並び順に連鎖） ---
-    if redo:
-        all_chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number",
-                            (work["id"],))
-        for n in range(lo, hi + 1):
-            if _cancelled(job):
-                return
-            ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?", (work["id"], n))
-            if ch and ch["status"] in ("outlined", "generated"):
-                _expand_one_plan(work, ch, all_chapters)
+    # --- 展開計画：作り直しでは作り直し、続き作成・前半では無い章だけ作る ---
+    all_chapters = db.q("SELECT * FROM chapters WHERE work_id=? ORDER BY number",
+                        (work["id"],))
+    for n in range(lo, hi + 1):
+        if _cancelled(job):
+            return
+        ch = db.one("SELECT * FROM chapters WHERE work_id=? AND number=?", (work["id"], n))
+        if not ch:
+            continue
+        if redo and ch["status"] in ("outlined", "generated"):
+            _expand_one_plan(work, ch, all_chapters)
+        elif not redo and ch["status"] == "outlined" \
+                and not latest_artifact(work["id"], ch["id"], "plan"):
+            _expand_one_plan(work, ch, all_chapters)
     # --- 本文（推敲なし） ---
     if redo:
         db.run("UPDATE chapters SET status='outlined' WHERE work_id=? AND number BETWEEN ? AND ? AND status='generated'",

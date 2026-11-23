@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.72"
+APP_VERSION = "1.73"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -1236,9 +1236,10 @@ def work_detail(work_id: int):
     <button name='range_mode' value='first'>前半を作成</button></div>
     <div class='row'>後半：第<input type='text' name='from_ch' value='{_def_from}' style='width:4em'>章 〜 第<input type='text' name='to_ch' value='{_def}' style='width:4em'>章
     <button name='range_mode' value='cont'>続きを作成（未生成の章だけ）</button>
-    <button name='range_mode' value='redo'>作り直し（生成済みも含む）</button></div>
+    <button name='range_mode' value='redo'>作り直し（生成済みも含む）</button>
+    <button name='range_mode' value='regen'>指定章を再生成（計画＋本文）</button></div>
     </form>
-    <p>後半は、作成したい範囲を「第○章 〜 第○章」で直接指定します。実行には、開始章の前章の終了状態（キャラ表含む状態チェーン）が必要です。ない場合はお知らせに表示して実行しません。作り直しでは、章概要はそのまま（編集・反映済みの概要を使います）で、展開計画と本文を作り直します（旧本文は前版として自動で残ります）。概要が無い章は、先に概要を作成します。{'続き作品では、開始を第1章にすると第0章（読み込んだ文書）の続きとして作成します。' if _cont else ''}</p></div>"""
+    <p>後半は、作成したい範囲を「第○章 〜 第○章」で直接指定します。実行には、開始章の前章の終了状態（キャラ表含む状態チェーン）が必要です。ない場合はお知らせに表示して実行しません。作り直しでは、章概要はそのまま（編集・反映済みの概要を使います）で、展開計画と本文を作り直します（旧本文は前版として自動で残ります）。概要が無い章は、先に概要を作成します。続きを作成・前半を作成でも、展開計画が無い章には詳細概要～終了状態まで自動で作ってから本文に入ります。「指定章を再生成」は2次修正済みの章も対象で、修正概要がある章はそれを参考に（計画は修正概要から作り直し、本文は修正概要優先で再生成）、無い章は計画（詳細概要～終了状態）と生成指示書を作り直してから本文を再生成します。{'続き作品では、開始を第1章にすると第0章（読み込んだ文書）の続きとして作成します。' if _cont else ''}</p></div>"""
 
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
     notice_html = ""
@@ -1508,7 +1509,7 @@ def work_range(work_id: int, range_mode: str = Form(...),
                                    "先に「1. 続き読み込み」で文書をアップロードしてください。")
             return back()
         payload = {"from": lo, "to": hi, "analyze_first": cont}
-    elif range_mode in ("cont", "redo"):
+    elif range_mode in ("cont", "redo", "regen"):
         lo = int(from_ch or 0)
         if lo < 1:
             pipeline.add_notice(w, "開始の章番号（第1章以降）を指定してください。"
@@ -1518,7 +1519,8 @@ def work_range(work_id: int, range_mode: str = Form(...),
         if not pipeline._prev_end_state_exists(w, lo):
             pipeline.add_notice(w, pipeline._missing_state_message(w, lo - 1))
             return back()
-        payload = {"from": lo, "to": hi, "redo": range_mode == "redo"}
+        payload = {"from": lo, "to": hi, "redo": range_mode == "redo",
+                   "regen": range_mode == "regen"}
     else:
         return PlainTextResponse("bad mode", status_code=400)
     pipeline.set_stage(work_id, "outlining")
