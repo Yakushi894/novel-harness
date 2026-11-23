@@ -1581,8 +1581,33 @@ def resolve_term(work, term):
 
 
 def add_notice(work, body):
+    # 直前と同文のお知らせは重ねて出さない（停止を繰り返した際の同文連投対策）
+    last = db.one("SELECT body FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 1",
+                  (work["id"],))
+    if last and last["body"] == body:
+        return
     db.run("INSERT INTO notices(work_id, body, created_at) VALUES(?,?,?)",
            (work["id"], body, db.now()))
+
+
+# お知らせ用の工程名（main.JOB_LABELS と同内容。pipeline から main は import できない）
+NOTICE_JOB_LABELS = {"analyze": "初期文書解析", "outline": "各章概要の生成",
+                     "expand_plans": "各章を展開", "expand_plan_one": "展開計画の生成（この章のみ）",
+                     "plan_design": "展開計画・生成指示書の再生成（この章のみ）",
+                     "regen_plan": "展開計画の再生成", "generate_chapters": "本文生成（1次出力）",
+                     "generate_thread": "章ごとスレッド生成", "revise_all": "2次修正",
+                     "regen_chapter": "本文の再生成", "regen_full": "展開計画～終了状態まで自動再生成",
+                     "revise_outline": "修正概要の作成", "revise_more": "修正概要への追記＋本文の再生成",
+                     "revise_append": "修正概要への追記（概要のみ）", "outline_chapter": "概要の再生成",
+                     "search_term": "キャラクター検索", "term_check": "用語チェック",
+                     "final_check": "最終チェック", "range_generate": "範囲指定の生成"}
+
+
+def _queue_left(work_id):
+    """その作品で実行待ち（queued）のジョブ数。"""
+    rows = db.q("SELECT COUNT(*) AS n FROM jobs WHERE work_id=? AND status='queued'",
+                (work_id,))
+    return rows[0]["n"] if rows else 0
 
 
 def checked_terms(work):
@@ -2054,10 +2079,17 @@ def worker_loop():
             llm.USAGE_SINK = _usage_sink_for(job["id"])
             llm.CANCEL_CHECK = (lambda jid: lambda: _cancelled({"id": jid}))(job["id"])
             llm._PHASE_WID = job["work_id"]
+            label = NOTICE_JOB_LABELS.get(job["kind"], job["kind"])
+            if work:
+                add_notice(work, f"「{label}」を開始しました。生成中です"
+                                 f"（キューの残り：{_queue_left(work['id'])}件）")
             try:
                 HANDLERS[job["kind"]](job, work)
                 if not _cancelled(job):
                     db.run("UPDATE jobs SET status='done', updated_at=? WHERE id=?", (db.now(), job["id"]))
+                    if work:
+                        add_notice(work, f"「{label}」が終了しました"
+                                         f"（キューの残り：{_queue_left(work['id'])}件）")
             except llm.JobCancelledError:
                 # ユーザーの停止：生成中の接続は llm 側で切断済み。failed にはしない。
                 db.run("UPDATE jobs SET status='cancelled', updated_at=? WHERE id=? AND status='running'",
@@ -2075,6 +2107,8 @@ def worker_loop():
                 db.run("UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
                        (err[:500], db.now(), job["id"]))
                 if work:
+                    add_notice(work, f"「{label}」がエラーで終了しました：{str(e)[:80]}"
+                                     f"（キューの残り：{_queue_left(work['id'])}件）")
                     if isinstance(e, llm.LoopDetectedError) and not e.saved_log:
                         # 章に紐づかない工程（概要・解析・状態・要約など）でループした場合は
                         # 作品レベルの異常終了ログを成果物に残す
