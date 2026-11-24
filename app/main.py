@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.76"
+APP_VERSION = "1.77"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -56,6 +56,39 @@ STAGE_LABEL = {
 }
 
 FLOW_STEPS = ["1. 続き読み込み", "2. 次章の内容", "3. 1次出力", "4. 2次修正", "5. PHP・TXT化"]
+
+
+def _display_stage(w) -> str:
+    """表示用の状態（stage の「エラー」固定対策）。
+
+    stage は一部の工程しか更新しないため、一度 failed／cancelled になると
+    別の工程を再実行して成功しても表示が「エラー」のまま残ることがある。
+    失敗・停止より後に成功したジョブがある、または実行中・実行待ちの
+    ジョブがある場合は復旧済みとみなし、成果物から進み具合の状態を返す。
+    """
+    st = w["stage"] or "draft"
+    if st not in ("failed", "cancelled"):
+        return st
+    wid = w["id"]
+    active = db.one("SELECT id FROM jobs WHERE work_id=? AND status IN ('running','queued') LIMIT 1",
+                    (wid,))
+    last_bad = db.one("SELECT MAX(id) AS m FROM jobs WHERE work_id=? AND status IN ('failed','cancelled')",
+                      (wid,))
+    last_done = db.one("SELECT MAX(id) AS m FROM jobs WHERE work_id=? AND status='done'", (wid,))
+    recovered = bool(active) or bool(
+        last_done and last_done["m"]
+        and (not last_bad or not last_bad["m"] or last_done["m"] > last_bad["m"]))
+    if not recovered:
+        return st
+    if db.one("SELECT id FROM artifacts WHERE work_id=? AND kind='final' LIMIT 1", (wid,)):
+        return "done"
+    if db.one("SELECT id FROM artifacts WHERE work_id=? AND kind='draft' LIMIT 1", (wid,)):
+        return "body_ready"
+    if db.one("SELECT id FROM chapters WHERE work_id=? AND number>=1 AND outline<>'' LIMIT 1", (wid,)):
+        return "outline_review"
+    if db.one("SELECT id FROM artifacts WHERE work_id=? AND kind='analysis' LIMIT 1", (wid,)):
+        return "analyzed"
+    return "draft"
 
 CSS = """
 *{box-sizing:border-box}
@@ -586,7 +619,7 @@ def index():
     works = db.q("SELECT * FROM works ORDER BY id DESC")
     items = "".join(
         f"<div class='card'><a href='/works/{w['id']}'><b>{esc(w['title'])}</b></a>"
-        f" ― 状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}"
+        f" ― 状態：{esc(STAGE_LABEL.get(_display_stage(w), _display_stage(w)))}"
         f" <form method='post' action='/works/{w['id']}/delete' style='display:inline' "
         f"onsubmit=\"return confirm('このワークスペースを削除しますか？（作品データが消えます。用語DBは残ります）')\">"
         f"<button style='background:#b03a3a;border-color:#b03a3a'>削除</button></form></div>"
@@ -948,7 +981,7 @@ def _work_head_html(w) -> str:
     """作品ページ冒頭の状態・モデル表示フラグメント。"""
     draft_model = db.get_setting(f"work:{w['id']}:draft_model", "")
     revise_model = db.get_setting(f"work:{w['id']}:revise_model", "")
-    return (f"<p>状態：{esc(STAGE_LABEL.get(w['stage'], w['stage']))}</p>"
+    return (f"<p>状態：{esc(STAGE_LABEL.get(_display_stage(w), _display_stage(w)))}</p>"
             f"<p class='steps'>工程：{' ⇒ '.join(FLOW_STEPS)}</p>"
             f"<p>ロード中モデル：{_loaded_model_html()}"
             f" ／ 1次出力モデル：{esc(draft_model) or '―'} ／ 2次修正モデル：{esc(revise_model) or '―'}</p>")
