@@ -24,7 +24,7 @@ import pipeline
 UI_TOKEN = os.environ.get("UI_TOKEN", "")
 app = FastAPI(title="novel-harness")
 
-APP_VERSION = "1.77"
+APP_VERSION = "1.78"
 DOCKERHUB_URL = "https://hub.docker.com/r/yuichi894/novel-harness"
 DOCKERHUB_SVG = (
     "<svg width='58' height='42' viewBox='0 0 58 42' xmlns='http://www.w3.org/2000/svg' "
@@ -409,10 +409,23 @@ POLL_SCRIPT = """
     var nd = el.querySelectorAll('details');
     for(var j=0;j<nd.length && j<opens.length;j++) if(opens[j]) nd[j].open = true;
   }
+  // 未送信の入力（書きかけの文）があるか。初期値と違う textarea・入力欄・
+  // チェックが1つでもあれば「記入中」とみなす。
+  function dirty(){
+    var els = document.querySelectorAll('textarea, input');
+    for(var i=0;i<els.length;i++){
+      var e = els[i];
+      if(e.type === 'hidden' || e.type === 'file' || e.type === 'submit' || e.type === 'button') continue;
+      if(e.type === 'checkbox' || e.type === 'radio'){
+        if(e.checked !== e.defaultChecked) return true;
+      } else if(e.value !== e.defaultValue) return true;
+    }
+    return false;
+  }
   function tick(){
     fetch(url).then(function(r){ return r.json(); }).then(function(j){
       if(j.stop) return;
-      if(j.reload){ location.reload(); return; }
+      var wantReload = !!j.reload;
       var nearBottom = (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 240);
       var regions = j.regions || {};
       for(var id in regions) swap(id, regions[id]);
@@ -427,6 +440,10 @@ POLL_SCRIPT = """
         if(se && se.style.cssText !== styles[sid]) se.style.cssText = styles[sid];
       }
       if(nearBottom) window.scrollTo(0, document.documentElement.scrollHeight);
+      // 生成終了時の確定リロードは、未送信の入力がある間は行わない
+      // （書きかけの文が消えるため）。送信すれば画面遷移で確定表示になるし、
+      // 入力を初期値に戻せば次のポーリングでリロードされる。
+      if(wantReload && !dirty()){ location.reload(); return; }
       setTimeout(tick, 4000);
     }).catch(function(){ setTimeout(tick, 8000); });
   }
