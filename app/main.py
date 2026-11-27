@@ -120,6 +120,19 @@ textarea{width:100%} input[type=text]{width:100%}
 pre{white-space:pre-wrap;background:#f7f7f7;padding:1em;border-radius:8px}
 button{padding:.45em 1.1em;border:1px solid #2e6fdb;background:#2e6fdb;color:#fff;border-radius:8px;cursor:pointer}
 button:hover{background:#255cb8}
+button:disabled{opacity:.55;cursor:wait}
+button:disabled:hover{background:#2e6fdb}
+.copy-wrap{position:relative}
+.copy-btn{position:absolute;top:.45em;right:.45em;padding:.15em .7em;font-size:.8em;opacity:.85;z-index:2}
+.copy-btn:hover{opacity:1}
+.side-toggle{float:right;background:transparent;border:1px solid #3a3f47;color:#dfe3e8;padding:.05em .5em;font-size:.85rem;border-radius:6px}
+.layout.side-collapsed .sidebar{width:52px;flex:0 0 52px;padding:1em .35em;overflow-x:hidden}
+.layout.side-collapsed .sidebar .side-sec,
+.layout.side-collapsed .sidebar .ws-item,
+.layout.side-collapsed .sidebar .ch-item,
+.layout.side-collapsed .sidebar .side-foot{display:none}
+.layout.side-collapsed .brand{font-size:0;padding:.2em 0 .6em;text-align:center}
+.layout.side-collapsed .side-toggle{float:none}
 form.act{margin-top:.9em}
 form.act button{padding:.32em .95em}
 form.act span{display:block;margin-top:.3em;color:#444;font-size:.92em;line-height:1.55}
@@ -384,7 +397,8 @@ def sidebar(current_id=None, chapters=None) -> str:
                     "<button class='ch-del' title='この章を削除'>✕</button></form></div>")
     return (
         "<div class='sidebar'>"
-        "<div class='brand'>📚 小説ハーネス</div>"
+        "<div class='brand'>📚 小説ハーネス"
+        "<button type='button' class='side-toggle' id='side-toggle' title='サイドバーを折りたたむ'>◀</button></div>"
         "<a class='ws-item' href='/'>＋ 新規ワークスペース</a>"
         "<div class='side-sec'>ワークスペース</div>"
         + (items or "<div class='ws-item'>まだありません</div>")
@@ -491,6 +505,90 @@ SIDEBAR_SCRIPT = """
 """
 
 
+UX_SCRIPT = """
+<script>
+// UI改善（Grok提案 Issue #2 の 1・2・4）：全ページ共通。
+// 1) フォーム二重押し防止：送信したらそのフォームのボタンを無効化し、
+//    押したボタンを「処理中…」にする。復帰は送信後の画面遷移（リロード）で
+//    自然に行われる。サーバー側でも enqueue が同一ジョブの重複を弾く。
+// 2) <pre> へのコピーボタン自動付与：逐次更新で差し替わった <pre> にも
+//    MutationObserver で追随する。LAN内 http では Clipboard API が
+//    使えない場合があるため execCommand へフォールバックする。
+// 4) サイドバーの折りたたみ：状態は localStorage に記憶する。
+(function(){
+  var layout = document.querySelector('.layout');
+  var sideBtn = document.getElementById('side-toggle');
+  function applySide(collapsed){
+    if(!layout) return;
+    if(collapsed) layout.classList.add('side-collapsed');
+    else layout.classList.remove('side-collapsed');
+    if(sideBtn){
+      sideBtn.textContent = collapsed ? '▶' : '◀';
+      sideBtn.title = collapsed ? 'サイドバーを広げる' : 'サイドバーを折りたたむ';
+    }
+  }
+  var collapsed = false;
+  try{ collapsed = localStorage.getItem('nh:sidebar') === 'collapsed'; }catch(e){}
+  applySide(collapsed);
+  if(sideBtn) sideBtn.addEventListener('click', function(){
+    collapsed = !collapsed;
+    try{ localStorage.setItem('nh:sidebar', collapsed ? 'collapsed' : 'open'); }catch(e){}
+    applySide(collapsed);
+  });
+
+  document.addEventListener('submit', function(e){
+    if(e.defaultPrevented) return;  // confirm() 等で中止された送信は対象外
+    var btns = e.target.querySelectorAll('button');
+    for(var i=0;i<btns.length;i++){
+      if(btns[i] === e.submitter) btns[i].textContent = '処理中…';
+      btns[i].disabled = true;
+    }
+  });
+
+  function copyText(text, done){
+    function fallback(){
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      try{ document.execCommand('copy'); }catch(e){}
+      document.body.removeChild(ta); done();
+    }
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else fallback();
+  }
+  function attachCopy(pre){
+    if(pre.getAttribute('data-copy') === '1') return;
+    pre.setAttribute('data-copy', '1');
+    var wrap = document.createElement('div');
+    wrap.className = 'copy-wrap';
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(pre);
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'copy-btn'; b.textContent = 'コピー';
+    b.addEventListener('click', function(){
+      copyText(pre.innerText, function(){
+        b.textContent = 'コピーしました';
+        setTimeout(function(){ b.textContent = 'コピー'; }, 1600);
+      });
+    });
+    wrap.appendChild(b);
+  }
+  function attachAll(){
+    var pres = document.querySelectorAll('pre');
+    for(var i=0;i<pres.length;i++) attachCopy(pres[i]);
+  }
+  attachAll();
+  if(window.MutationObserver && document.body){
+    new MutationObserver(function(){ attachAll(); })
+      .observe(document.body, {childList:true, subtree:true});
+  }
+})();
+</script>
+"""
+
+
 def page(title: str, body: str, current_id=None, chapters=None, refresh: bool = False,
          live_url: str = None) -> HTMLResponse:
     if live_url:
@@ -506,7 +604,7 @@ def page(title: str, body: str, current_id=None, chapters=None, refresh: bool = 
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{esc(title)}</title><style>{CSS}</style></head><body>"
         f"<div class='layout'>{sidebar(current_id, chapters)}"
-        f"<div class='main'><h1>{esc(title)}</h1>{body}</div></div>{auto}</body></html>")
+        f"<div class='main'><h1>{esc(title)}</h1>{body}</div></div>{auto}{UX_SCRIPT}</body></html>")
 
 
 def authed(request: Request) -> bool:
@@ -776,9 +874,18 @@ def usage_html(job) -> str:
 
 
 def enqueue(work_id: int, kind: str, payload: dict | None = None):
+    """ジョブをキューに入れる。同じ作品・工程・対象が実行待ち／実行中なら、
+    二重押し（連打・フォーム再送信）による多重ジョブを防ぐため追加しない。
+    終了済みの工程は従来どおり再実行できる。"""
+    payload_json = db.dumps(payload or {})
+    dup = db.one("SELECT id FROM jobs WHERE work_id=? AND kind=? AND payload=?"
+                 " AND status IN ('queued','running') LIMIT 1",
+                 (work_id, kind, payload_json))
+    if dup:
+        return
     db.run("INSERT INTO jobs(work_id, kind, status, payload, created_at, updated_at)"
            " VALUES(?,?,'queued',?,?,?)",
-           (work_id, kind, db.dumps(payload or {}), db.now(), db.now()))
+           (work_id, kind, payload_json, db.now(), db.now()))
 
 
 def _job_payload(j) -> dict:
@@ -1283,8 +1390,17 @@ def work_detail(work_id: int):
     notices = db.q("SELECT * FROM notices WHERE work_id=? ORDER BY id DESC LIMIT 20", (work_id,))
     notice_html = ""
     if notices:
-        notice_html = ("<h3 style='margin-top:1.2em'>お知らせ（用語DB）</h3>" + "".join(
-            f"<div>{esc(n['body'])}</div>" for n in notices))
+        # 直近5件だけを出し、残りは折りたたみに収める（現在状況のお知らせが
+        # 増えると用語DBのお知らせが埋もれ、逆も起きるため）。
+        _shown = "".join(f"<div>{esc(n['body'])}</div>" for n in notices[:5])
+        _rest = notices[5:]
+        _fold = ""
+        if _rest:
+            _fold = (f"<details><summary>過去のお知らせ（{len(_rest)}件）を表示</summary>"
+                     + "".join(f"<div>{esc(n['body'])}</div>" for n in _rest)
+                     + "</details>")
+        notice_html = ("<h3 style='margin-top:1.2em'>お知らせ（現在状況・用語DB）</h3>"
+                       + _shown + _fold)
 
     job_html = _jobs_html(w, jobs)
     art_html = "".join(
